@@ -124,6 +124,18 @@ Press Ctrl+C to shut down; SIGTERM is also supported on POSIX systems. After a s
 - `--log-file` and `--pid-file` also work in the foreground. A foreground instance only records a pid file when `--pid-file` is given explicitly, and then `--stop` can shut it down too.
 - This is process detachment, not a system service: nothing starts the gateway on boot or restarts it after a crash — use systemd, launchd or Windows service tooling for that. Like any pid-file scheme, `--stop` trusts the recorded pid; if the operating system has recycled that pid for an unrelated process, that process is targeted.
 
+### Docker
+
+Multi-arch images (`linux/amd64`, `linux/arm64`) are published to [`kunxu984/coniferous-cmd`](https://hub.docker.com/r/kunxu984/coniferous-cmd) on Docker Hub whenever a `v*` tag is pushed; other pushes only build the image to validate the Dockerfile. Mount a config that listens on all interfaces:
+
+```sh
+docker run --rm -p 8080:8080 \
+  -v "$PWD/config.yaml:/etc/llm-gateway/config.yaml:ro" \
+  kunxu984/coniferous-cmd:latest
+```
+
+The image runs as a non-root user and reads `--config /etc/llm-gateway/config.yaml` by default, so `listen` must be `0.0.0.0:8080` for the port mapping to reach the gateway.
+
 ## Request examples
 
 With Ollama running locally and the model `llama3.2` installed, using the sample `sk-virt-local`:
