@@ -4,6 +4,10 @@ A lightweight, locally running LLM gateway: callers only store virtual keys; the
 
 Supports Windows, Linux, macOS (amd64 / arm64). The release is a single binary with no dependency on Go, Node.js, Python, or a C compiler; the config file is supplied separately. The only third-party Go dependency is `gopkg.in/yaml.v3`, used to parse YAML at startup.
 
+## Download
+
+Prebuilt binaries for Windows, Linux and macOS (amd64 / arm64, plus Linux arm) are published on the [Releases](../../releases) page. Each archive contains the binary and `config.example.yaml`; a `SHA256SUMS` file is provided for verification. Check the binary's version with `llm-gateway --version`.
+
 ## Install and build
 
 Building from source requires **Go 1.26.4 or newer**. GNU Make is optional; running and building the release binary does not require a C compiler.

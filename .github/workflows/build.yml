@@ -60,8 +60,12 @@ jobs:
           if [[ "$GOOS" == windows ]]; then
             binary="${binary}.exe"
           fi
+          version="${GITHUB_REF_NAME}"
+          if [[ "$GITHUB_REF_TYPE" != "tag" ]]; then
+            version="$(git describe --tags --always)"
+          fi
           mkdir -p "dist/$name"
-          go build -trimpath -ldflags='-s -w' -o "dist/$name/$binary" ./cmd/llm-gateway
+          go build -trimpath -ldflags="-s -w -X main.version=${version}" -o "dist/$name/$binary" ./cmd/llm-gateway
           cp config.example.yaml "dist/$name/"
           if [[ "$GOOS" == windows ]]; then
             archive="${name}.zip"

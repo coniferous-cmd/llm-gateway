@@ -9,6 +9,8 @@ BIN_DIR ?= bin
 HOST_OS := $(shell $(GO) env GOOS)
 EXE := $(if $(filter windows,$(HOST_OS)),.exe,)
 BINARY := $(BIN_DIR)/llm-gateway$(EXE)
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+LDFLAGS := -s -w -X main.version=$(VERSION)
 
 # Release builds are pure Go and need no C compiler or shared Go runtime.
 export CGO_ENABLED := 0
@@ -27,9 +29,10 @@ help:
 	@echo make check       - Run tests and vet
 	@echo make build-all   - Build Windows, Linux and macOS for amd64 and arm64, plus Linux arm
 	@echo Override config: make run CONFIG=./config.example.yaml
+	@echo Override version: make build VERSION=v1.2.3 (default: git describe)
 
 build:
-	$(GO) build -trimpath -o "$(BINARY)" ./cmd/llm-gateway
+	$(GO) build -trimpath -ldflags="$(LDFLAGS)" -o "$(BINARY)" ./cmd/llm-gateway
 
 run: build
 	"./$(BINARY)" $(if $(CONFIG),--config "$(CONFIG)")
@@ -64,7 +67,7 @@ build-all: build-$(1)-$(2)
 build-$(1)-$(2): export GOOS := $(1)
 build-$(1)-$(2): export GOARCH := $(2)
 build-$(1)-$(2):
-	$$(GO) build -trimpath -o "$$(BIN_DIR)/llm-gateway-$(1)-$(2)$(3)" ./cmd/llm-gateway
+	$$(GO) build -trimpath -ldflags="$$(LDFLAGS)" -o "$$(BIN_DIR)/llm-gateway-$(1)-$(2)$(3)" ./cmd/llm-gateway
 endef
 
 $(eval $(call platform,windows,amd64,.exe))

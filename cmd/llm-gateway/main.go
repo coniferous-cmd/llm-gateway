@@ -22,13 +22,21 @@ import (
 // stopGrace exceeds the server's 10s drain window before --stop resorts to kill.
 const stopGrace = 12 * time.Second
 
+// version is stamped at build time via -ldflags "-X main.version=...".
+var version = "dev"
+
 func main() {
 	path := flag.String("config", "", "path to YAML configuration (default ~/.config/llm-gateway/config.yaml)")
 	background := flag.Bool("daemon", false, "run detached from the terminal; logs go to --log-file, use --stop to shut down")
 	stopFlag := flag.Bool("stop", false, "stop the gateway recorded in the pid file")
 	logPath := flag.String("log-file", "", "append logs to this file instead of stdout (default with --daemon: ~/.config/llm-gateway/llm-gateway.log)")
 	pidPath := flag.String("pid-file", "", "path to the pid file (default ~/.config/llm-gateway/llm-gateway.pid)")
+	versionFlag := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+	if *versionFlag {
+		fmt.Println("llm-gateway", version)
+		return
+	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	if *background && *stopFlag {
 		logger.Error("configuration failed", "error", fmt.Errorf("--daemon and --stop cannot be combined"))
@@ -102,7 +110,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	srv := server.New(cfg.Listen, keymap.New(cfg.Keys), logger)
-	logger.Info("starting", "listen", cfg.Listen)
+	logger.Info("starting", "listen", cfg.Listen, "version", version)
 	if err := server.Run(ctx, srv); err != nil {
 		logger.Error("server failed", "error", err)
 		os.Exit(1)
