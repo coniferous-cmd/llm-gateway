@@ -1,0 +1,16 @@
+# Build output and Go test artifacts
+/bin/
+/llm-gateway
+/llm-gateway.exe
+*.test
+*.test.exe
+coverage.out
+
+# Local configuration contains real credentials
+/config.yaml
+/config.local.yaml
+/config.local.yml
+
+# Editor and OS files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,11 @@
+listen: "127.0.0.1:8080"
+keys:
+  - token: sk-virt-dev
+    target:
+      base_url: https://api.openai.com
+      api_key: sk-real-replace-me
+  # Repeat a token to round-robin across compatible upstreams.
+  # api_key is optional for upstreams that do not require authentication.
+  - token: sk-virt-local
+    target:
+      base_url: http://127.0.0.1:11434/

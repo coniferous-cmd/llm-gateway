@@ -1,0 +1,98 @@
+// Package server assembles authentication, request logging and HTTP lifecycle.
+package server
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"log/slog"
+	"net"
+	"net/http"
+	"time"
+
+	"llm-gateway/internal/keymap"
+	"llm-gateway/internal/proxy"
+)
+
+func New(address string, keys *keymap.Map, logger *slog.Logger) *http.Server {
+	forward := proxy.New()
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started := time.Now()
+		response := &responseWriter{ResponseWriter: w}
+		target, ok := keys.Select(r.Header.Get("Authorization"))
+		defer func() {
+			status := response.status
+			if status == 0 {
+				status = http.StatusOK
+			}
+			logger.Info("request", "method", r.Method, "path", r.URL.Path,
+				"target", target.BaseURL, "status", status, "duration", time.Since(started))
+		}()
+		if !ok {
+			http.Error(response, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		forward.ServeHTTP(response, r.WithContext(keymap.WithTarget(r.Context(), target)))
+	})
+	return &http.Server{Addr: address, Handler: handler, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 90 * time.Second}
+}
+
+// Run waits for shutdown and drains active requests, including streams, for 10s.
+func Run(ctx context.Context, srv *http.Server) error {
+	done := make(chan error, 1)
+	go func() { done <- srv.ListenAndServe() }()
+	select {
+	case err := <-done:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			_ = srv.Close()
+			return err
+		}
+		err := <-done
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	}
+}
+
+type responseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *responseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func (w *responseWriter) WriteHeader(status int) {
+	if w.status != 0 {
+		return
+	}
+	if status >= 200 {
+		w.status = status
+	}
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *responseWriter) Write(data []byte) (int, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(data)
+}
+
+func (w *responseWriter) Flush() {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	_ = http.NewResponseController(w.ResponseWriter).Flush()
+}
+
+func (w *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return http.NewResponseController(w.ResponseWriter).Hijack()
+}
