@@ -112,6 +112,25 @@ The gateway does not require a `/v1` prefix, nor does it restrict methods or con
 - Upstream HTTP errors such as `429`: status code and body are passed through as-is.
 - JSON logs go to stdout, one line per request, with method, path (query excluded), target, status, and duration; auth headers and bodies are never logged.
 
+## Python request test scripts
+
+The two scripts use the official `openai` and `anthropic` Python SDKs, print the HTTP status, response headers, and body, and exit with code 1 on non-2xx. SDK auto-retries are disabled, and system proxy settings are ignored so the scripts connect directly to the gateway. Dependencies are installed into the development `agents` environment and do not affect the Go gateway's runtime dependencies:
+
+```sh
+mamba run -n agents python -m pip install openai anthropic
+```
+
+The gateway must already be running. The default virtual key is `sk-virt-dev`, or supply one via the `GATEWAY_TOKEN` environment variable; never give the scripts a real upstream key.
+
+```sh
+mamba run -n agents python scripts/test_openai.py
+mamba run -n agents python scripts/test_anthropic.py
+```
+
+The default model is `mimo-v2.6-flash`, which has been verified working; override it with `--model`. In the Xiaomi endpoint test, model names with the `[1m]` suffix returned `400 Unsupported model`. The OpenAI default base URL is `http://127.0.0.1:8080/v1` (SDK configs include `/v1`), the Anthropic one is `http://127.0.0.1:8080/anthropic`; both can be changed with `--base-url`.
+
+Both scripts use the Bearer authentication the gateway supports. `test_anthropic.py --auth-mode api-key` can exercise the x-api-key-only mode, but the current gateway does not accept that auth scheme, so it cannot be used to judge an upstream's authentication capabilities.
+
 ## Development and cross-platform verification
 
 ```sh
