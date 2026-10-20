@@ -1,0 +1,9 @@
+.git/
+.github/
+.claude/
+.pi/
+bin/
+scripts/
+speckit/
+*.md
+config.example.yaml
