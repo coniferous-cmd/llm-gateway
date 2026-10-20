@@ -14,10 +14,19 @@ import (
 )
 
 func main() {
-	path := flag.String("config", "config.yaml", "path to YAML configuration")
+	path := flag.String("config", "", "path to YAML configuration (default ~/.config/llm-gateway/config.yaml)")
 	flag.Parse()
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	cfg, err := config.Load(*path)
+	configPath := *path
+	if configPath == "" {
+		defaultPath, err := config.DefaultPath()
+		if err != nil {
+			logger.Error("configuration failed", "error", err)
+			os.Exit(1)
+		}
+		configPath = defaultPath
+	}
+	cfg, err := config.Load(configPath)
 	if err != nil {
 		logger.Error("configuration failed", "error", err)
 		os.Exit(1)

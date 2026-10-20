@@ -31,7 +31,7 @@ With GNU Make, `make build` disables CGO by default and builds the native binary
 
 ## Configuration
 
-Copy `config.example.yaml` to `config.yaml`, or create the following file:
+Copy `config.example.yaml` to `~/.config/llm-gateway/config.yaml` (or pass its location with `--config`), or create the following file:
 
 ```yaml
 listen: "127.0.0.1:8080" # optional, this is the default address
@@ -80,7 +80,7 @@ Windows PowerShell:
 .\bin\llm-gateway.exe --config .\config.yaml
 ```
 
-Both `--config` and `-config` work; when omitted, `config.yaml` in the current directory is read. With GNU Make you can also run `make run CONFIG=./config.yaml`.
+Both `--config` and `-config` work; when omitted, `~/.config/llm-gateway/config.yaml` is read (the home directory's `.config` folder, e.g. `C:\Users\<you>\.config\llm-gateway\config.yaml` on Windows). With GNU Make you can also run `make run CONFIG=./config.yaml`.
 
 Press Ctrl+C to shut down; SIGTERM is also supported on POSIX systems. After a shutdown signal, in-flight requests get up to 10 seconds to finish before connections are closed.
 

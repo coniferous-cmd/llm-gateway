@@ -5,12 +5,22 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 )
 
 const DefaultListen = "127.0.0.1:8080"
+
+// DefaultPath is the config location used when --config is not given.
+func DefaultPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve home directory: %w", err)
+	}
+	return filepath.Join(home, ".config", "llm-gateway", "config.yaml"), nil
+}
 
 type Target struct {
 	BaseURL string `yaml:"base_url"`

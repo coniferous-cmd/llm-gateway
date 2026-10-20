@@ -51,6 +51,21 @@ func TestParse(t *testing.T) {
 	}
 }
 
+func TestDefaultPath(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := DefaultPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(home, ".config", "llm-gateway", "config.yaml")
+	if path != want {
+		t.Fatalf("DefaultPath() = %q, want %q", path, want)
+	}
+}
+
 func TestLoad(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	if _, err := Load(path); err == nil {

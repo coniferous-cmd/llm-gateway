@@ -3,7 +3,8 @@
 .DEFAULT_GOAL := help
 
 GO ?= go
-CONFIG ?= config.yaml
+# Empty CONFIG lets the binary use its default ~/.config/llm-gateway/config.yaml.
+CONFIG ?=
 BIN_DIR ?= bin
 HOST_OS := $(shell $(GO) env GOOS)
 EXE := $(if $(filter windows,$(HOST_OS)),.exe,)
@@ -16,7 +17,7 @@ export CGO_ENABLED := 0
 
 help:
 	@echo make build       - Build the native executable in $(BIN_DIR)
-	@echo make run         - Build and run with CONFIG=config.yaml
+	@echo make run         - Build and run; CONFIG=./config.yaml optional
 	@echo make test        - Run unit tests
 	@echo make test-race   - Run race tests; requires a native C compiler
 	@echo make vet         - Run go vet
@@ -29,7 +30,7 @@ build:
 	$(GO) build -trimpath -o "$(BINARY)" ./cmd/llm-gateway
 
 run: build
-	"./$(BINARY)" --config "$(CONFIG)"
+	"./$(BINARY)" $(if $(CONFIG),--config "$(CONFIG)")
 
 test:
 	$(GO) test ./...
