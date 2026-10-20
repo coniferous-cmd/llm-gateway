@@ -13,11 +13,13 @@ BINARY := $(BIN_DIR)/llm-gateway$(EXE)
 # Release builds are pure Go and need no C compiler or shared Go runtime.
 export CGO_ENABLED := 0
 
-.PHONY: help build run test test-race vet fmt check build-all
+.PHONY: help build run daemon stop test test-race vet fmt check build-all
 
 help:
 	@echo make build       - Build the native executable in $(BIN_DIR)
 	@echo make run         - Build and run; CONFIG=./config.yaml optional
+	@echo make daemon      - Build and run detached in the background; CONFIG optional
+	@echo make stop        - Stop the background gateway
 	@echo make test        - Run unit tests
 	@echo make test-race   - Run race tests; requires a native C compiler
 	@echo make vet         - Run go vet
@@ -31,6 +33,12 @@ build:
 
 run: build
 	"./$(BINARY)" $(if $(CONFIG),--config "$(CONFIG)")
+
+daemon: build
+	"./$(BINARY)" --daemon $(if $(CONFIG),--config "$(CONFIG)")
+
+stop:
+	"./$(BINARY)" --stop
 
 test:
 	$(GO) test ./...

@@ -13,13 +13,22 @@ import (
 
 const DefaultListen = "127.0.0.1:8080"
 
-// DefaultPath is the config location used when --config is not given.
-func DefaultPath() (string, error) {
+// DefaultDir is the directory holding the config, pid and log files.
+func DefaultDir() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("resolve home directory: %w", err)
 	}
-	return filepath.Join(home, ".config", "llm-gateway", "config.yaml"), nil
+	return filepath.Join(home, ".config", "llm-gateway"), nil
+}
+
+// DefaultPath is the config location used when --config is not given.
+func DefaultPath() (string, error) {
+	dir, err := DefaultDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "config.yaml"), nil
 }
 
 type Target struct {

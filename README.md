@@ -84,6 +84,20 @@ Both `--config` and `-config` work; when omitted, `~/.config/llm-gateway/config.
 
 Press Ctrl+C to shut down; SIGTERM is also supported on POSIX systems. After a shutdown signal, in-flight requests get up to 10 seconds to finish before connections are closed.
 
+### Background mode
+
+`--daemon` starts the gateway detached from the terminal and returns immediately:
+
+```sh
+./bin/llm-gateway --daemon --config ./config.yaml
+```
+
+- The binary re-launches itself as a detached process. JSON logs are appended to `~/.config/llm-gateway/llm-gateway.log` (override with `--log-file`), and the process id is recorded in `~/.config/llm-gateway/llm-gateway.pid` (override with `--pid-file`). The command returns only after the gateway is actually listening; on failure it reports the log file to inspect.
+- `--stop` shuts the gateway down and removes the pid file. On POSIX systems it receives SIGTERM and gets the same 10-second drain as Ctrl+C before being killed; on Windows it is terminated immediately and in-flight requests are cut.
+- Only one gateway can hold a pid file: starting a second one reports `already running`, and `--stop` with no running gateway reports `not running` and exits non-zero.
+- `--log-file` and `--pid-file` also work in the foreground. A foreground instance only records a pid file when `--pid-file` is given explicitly, and then `--stop` can shut it down too.
+- This is process detachment, not a system service: nothing starts the gateway on boot or restarts it after a crash — use systemd, launchd or Windows service tooling for that. Like any pid-file scheme, `--stop` trusts the recorded pid; if the operating system has recycled that pid for an unrelated process, that process is targeted.
+
 ## Request examples
 
 With Ollama running locally and the model `llama3.2` installed, using the sample `sk-virt-local`:
@@ -110,7 +124,7 @@ The gateway does not require a `/v1` prefix, nor does it restrict methods or con
 - Missing, malformed, or unknown virtual key: `401 Unauthorized`, and no upstream is contacted.
 - Upstream connection failure: `502 Bad Gateway`; no switch to another target. The next request continues the round-robin sequence.
 - Upstream HTTP errors such as `429`: status code and body are passed through as-is.
-- JSON logs go to stdout, one line per request, with method, path (query excluded), target, status, and duration; auth headers and bodies are never logged.
+- JSON logs go to stdout, or to the `--log-file` destination, one line per request, with method, path (query excluded), target, status, and duration; auth headers and bodies are never logged.
 
 ## Python request test scripts
 
@@ -151,6 +165,8 @@ With GNU Make:
 
 ```sh
 make help
+make daemon
+make stop
 make check
 make test-race
 make build-all
