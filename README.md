@@ -1,6 +1,6 @@
 # llm-gateway
 
-A lightweight, locally running LLM gateway: callers only store virtual keys; the gateway picks the upstream and swaps `Authorization`. It does not parse API protocols, modify request bodies, count tokens, retry, fail over, or hot-reload configuration.
+A lightweight, locally running LLM gateway: callers only store virtual keys; the gateway picks the upstream and swaps `Authorization`. It does not convert protocols, count tokens, retry, fail over, or hot-reload configuration. Request bodies pass through untouched, with one optional exception: [model routing](#model-routing) reads — and possibly rewrites — the top-level `model` field of JSON request bodies.
 
 Supports Windows, Linux, macOS (amd64 / arm64). The release is a single binary with no dependency on Go, Node.js, Python, or a C compiler; the config file is supplied separately. The only third-party Go dependency is `gopkg.in/yaml.v3`, used to parse YAML at startup.
 
@@ -50,6 +50,7 @@ keys:
 - `keys` must not be empty; each entry needs a non-empty `token` and a valid `target.base_url`.
 - `base_url` must be an HTTP(S) **bare origin**, e.g. `https://api.openai.com`; it must not contain a path such as `/v1`, a query, a fragment, or username/password. A trailing `/` is normalized away.
 - A non-empty `api_key` becomes `Authorization: Bearer <api_key>`; do not include `Bearer ` in the config value.
+- An entry may declare `models` — the model names it serves — turning on [model routing](#model-routing) for that token.
 - Declaring the same `token` again appends another target in config order; each authenticated request round-robins through them, with counters kept per token. Only put upstreams that are compatible in protocol and model names under the same token.
 - The config is loaded once at startup; changes require a restart. Startup validation failures report the offending field and exit.
 - The config contains plaintext secrets — never commit a real config; the default `.gitignore` already excludes `config.yaml`. Restrict file permissions and prefer listening on loopback only.
@@ -65,6 +66,31 @@ keys:
     target:
       base_url: http://127.0.0.1:11435
 ```
+
+### Model routing
+
+Each key entry may declare the models it serves:
+
+```yaml
+keys:
+  - token: sk-virt-dev
+    target:
+      base_url: https://api.example.com
+      api_key: sk-real-replace-me
+    models:
+      - id: mimo-v2.6-flash
+        name: mimo-v2.6-flash
+      - id: mimo-v2.6-pro
+        name: mimo-v2.6-pro
+```
+
+- `id` is the model name callers put in their requests, `name` is the model name the gateway passes to the provider. When they differ, the gateway rewrites the top-level `model` value of the JSON request body before forwarding; every other body byte stays identical. When they are equal, the body is forwarded unchanged.
+- For a request whose JSON body carries a top-level `model` **string**, the pair (virtual key, model id) picks the entry: the request goes to that entry's target and the token's round-robin counter is not touched. So several entries under one token can route different models to different providers.
+- A `model` value that no entry under the token declares returns `400 Bad Request`; no provider is contacted.
+- Requests without a resolvable `model` — no body, `GET /v1/models`, a non-JSON body, a `model` that is not a string, or a compressed body — are forwarded byte-for-byte unchanged and pick their target by round-robin as before. A missing `model` is then the provider's complaint to relay, not the gateway's.
+- A token whose entries declare no `models` keeps the original behavior exactly: request bodies are never read.
+- `id` values must be unique within one token (a duplicate is a startup error); the same `id` under different tokens is fine.
+- This is the only place the gateway reads request bodies. On model-enabled tokens bodies are buffered in memory (up to 32 MiB; beyond that the request is rejected with `413 Request Entity Too Large`), and bodies with a non-identity `Content-Encoding` pass through uninspected and unmodified.
 
 ## Running
 
@@ -118,10 +144,11 @@ The gateway does not require a `/v1` prefix, nor does it restrict methods or con
 
 ### Forwarding boundaries and errors
 
-- The connection address and HTTP `Host` are updated to the selected target (including non-default ports), so the gateway's local address is never sent to the upstream's virtual host. Beyond that, only authentication is rewritten; the original path (including encoding), query, body, and remaining application-layer headers stay unchanged. No forwarding headers such as `X-Forwarded-For` are added or appended; existing values are preserved.
+- The connection address and HTTP `Host` are updated to the selected target (including non-default ports), so the gateway's local address is never sent to the upstream's virtual host. Beyond that, only authentication is rewritten — plus, on model-enabled keys, the body's top-level `model` value when an alias is configured; the original path (including encoding), query, and remaining application-layer headers stay unchanged. No forwarding headers such as `X-Forwarded-For` are added or appended; existing values are preserved.
 - Hop-by-hop headers are handled per standard HTTP proxy rules — e.g. `Connection`, `Keep-Alive`, and any headers it names; the HTTP transport may re-frame the stream, so this is not a byte-level TCP tunnel.
 - Status codes, upstream application-layer response headers, and the body are passed through unchanged; no automatic decompression, SSE is forwarded chunk by chunk, and there is no overall write timeout. Connect timeout is 10 s, response-header timeout 30 s.
 - Missing, malformed, or unknown virtual key: `401 Unauthorized`, and no upstream is contacted.
+- Unknown model id on a model-enabled key: `400 Bad Request`; a request body beyond the inspection limit: `413 Request Entity Too Large`. In both cases no upstream is contacted.
 - Upstream connection failure: `502 Bad Gateway`; no switch to another target. The next request continues the round-robin sequence.
 - Upstream HTTP errors such as `429`: status code and body are passed through as-is.
 - JSON logs go to stdout, or to the `--log-file` destination, one line per request, with method, path (query excluded), target, status, and duration; auth headers and bodies are never logged.

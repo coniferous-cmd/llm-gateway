@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -44,10 +45,58 @@ func TestParse(t *testing.T) {
 			if cfg.Listen != DefaultListen || len(cfg.Keys["dev"]) != tt.count {
 				t.Fatalf("unexpected config: %+v", cfg)
 			}
-			if cfg.Keys["dev"][0].BaseURL != "https://example.com" {
+			if cfg.Keys["dev"][0].Target.BaseURL != "https://example.com" {
 				t.Fatal(cfg.Keys)
 			}
 		})
+	}
+}
+
+func TestParseModels(t *testing.T) {
+	entry := func(models string) string {
+		return "keys:\n  - token: dev\n    target: {base_url: 'https://example.com'}\n" + models
+	}
+	tests := []struct {
+		name, yaml, wantError string
+		want                  []Model
+	}{
+		{"declared", entry("    models:\n      - id: mimo-v2.6-flash\n        name: mimo-v2.6-flash\n      - id: mimo-v2.6-pro\n        name: mimo-pro\n"), "", []Model{{ID: "mimo-v2.6-flash", Name: "mimo-v2.6-flash"}, {ID: "mimo-v2.6-pro", Name: "mimo-pro"}}},
+		{"legacy without models", entry(""), "", nil},
+		{"empty list", entry("    models: []\n"), "", nil},
+		{"missing id", entry("    models:\n      - name: n\n"), "models[0].id", nil},
+		{"empty id", entry("    models:\n      - id: '  '\n        name: n\n"), "models[0].id", nil},
+		{"missing name", entry("    models:\n      - id: m\n"), "models[0].name", nil},
+		{"empty name", entry("    models:\n      - id: m\n        name: ''\n"), "models[0].name", nil},
+		{"duplicate id in one entry", entry("    models:\n      - id: m\n        name: a\n      - id: m\n        name: b\n"), "\"m\"", nil},
+		{"duplicate id across entries", entry("    models:\n      - id: mimo-v2.6-flash\n        name: m\n") + "  - token: dev\n    target: {base_url: 'https://other.com'}\n    models:\n      - id: mimo-v2.6-flash\n        name: renamed\n", "already declared", nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := Parse([]byte(tt.yaml))
+			if tt.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+					t.Fatalf("error = %v, want %q", err, tt.wantError)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(cfg.Keys["dev"][0].Models, tt.want) {
+				t.Fatalf("models = %#v, want %#v", cfg.Keys["dev"][0].Models, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseSameModelIDForDifferentTokens(t *testing.T) {
+	yaml := "keys:\n  - token: first\n    target: {base_url: 'https://example.com'}\n    models: [{id: m, name: m}]\n  - token: second\n    target: {base_url: 'https://other.com'}\n    models: [{id: m, name: m}]\n"
+	cfg, err := Parse([]byte(yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Keys["first"]) != 1 || len(cfg.Keys["second"]) != 1 {
+		t.Fatal(cfg.Keys)
 	}
 }
 
@@ -78,7 +127,7 @@ func TestLoad(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Listen != "127.0.0.1:9090" || cfg.Keys["dev"][0].APIKey != "" {
+	if cfg.Listen != "127.0.0.1:9090" || cfg.Keys["dev"][0].Target.APIKey != "" {
 		t.Fatal(cfg)
 	}
 }

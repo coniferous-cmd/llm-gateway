@@ -10,47 +10,95 @@ import (
 )
 
 func TestAuthentication(t *testing.T) {
-	m := New(map[string][]config.Target{"dev": {{BaseURL: "one"}}, "empty": nil})
+	m := New(map[string][]config.Entry{"dev": {{Target: config.Target{BaseURL: "one"}}}, "empty": nil})
 	for _, header := range []string{"", "Basic dev", "Bearer", "Bearer unknown", "Bearer dev extra", "Bearer empty"} {
 		if _, ok := m.Select(header); ok {
 			t.Fatalf("accepted %q", header)
 		}
 	}
 	for i := 0; i < 6; i++ {
-		target, ok := m.Select("bearer dev")
-		if !ok || target.BaseURL != "one" {
-			t.Fatal(target, ok)
+		route, ok := m.Select("bearer dev")
+		if !ok || route.RoundRobin().BaseURL != "one" {
+			t.Fatal(route, ok)
 		}
 	}
 }
 
 func TestRoundRobin(t *testing.T) {
-	targets := []config.Target{{BaseURL: "1"}, {BaseURL: "2"}, {BaseURL: "3"}}
-	m := New(map[string][]config.Target{"dev": targets, "other": targets})
-	targets[0].BaseURL = "mutated"
+	entries := []config.Entry{
+		{Target: config.Target{BaseURL: "1"}},
+		{Target: config.Target{BaseURL: "2"}},
+		{Target: config.Target{BaseURL: "3"}},
+	}
+	m := New(map[string][]config.Entry{"dev": entries, "other": entries})
+	entries[0].Target.BaseURL = "mutated"
 	for i := 0; i < 6; i++ {
-		target, ok := m.Select("Bearer dev")
-		if !ok || target.BaseURL != fmt.Sprint(i%3+1) {
-			t.Fatal(target, ok)
+		route, ok := m.Select("Bearer dev")
+		if !ok || route.RoundRobin().BaseURL != fmt.Sprint(i%3+1) {
+			t.Fatal("unbalanced rotation")
 		}
 	}
-	target, _ := m.Select("Bearer other")
-	if target.BaseURL != "1" {
+	route, _ := m.Select("Bearer other")
+	if route.RoundRobin().BaseURL != "1" {
 		t.Fatal("counters are not independent")
 	}
 }
 
+func TestModelResolution(t *testing.T) {
+	m := New(map[string][]config.Entry{"dev": {
+		{Target: config.Target{BaseURL: "flash"}, Models: []config.Model{{ID: "f", Name: "flash-real"}}},
+		{Target: config.Target{BaseURL: "pro"}, Models: []config.Model{{ID: "p", Name: "pro-real"}}},
+	}})
+	route, ok := m.Select("Bearer dev")
+	if !ok || !route.HasModels() {
+		t.Fatal("token with models not flagged")
+	}
+	target, model, ok := route.Resolve("f")
+	if !ok || target.BaseURL != "flash" || model != (config.Model{ID: "f", Name: "flash-real"}) {
+		t.Fatal(target, model, ok)
+	}
+	if _, _, ok := route.Resolve("unknown"); ok {
+		t.Fatal("unknown model id resolved")
+	}
+	// Matched picks must leave the round-robin rotation untouched.
+	for i := 0; i < 3; i++ {
+		route.Resolve("p")
+	}
+	for _, want := range []string{"flash", "pro"} {
+		if got := route.RoundRobin().BaseURL; got != want {
+			t.Fatalf("rotation shifted by model matches: got %q, want %q", got, want)
+		}
+	}
+	legacy, _ := m.Select("Bearer none")
+	if legacy != nil {
+		t.Fatal("unexpected route")
+	}
+}
+
+func TestLegacyTokenHasNoModels(t *testing.T) {
+	m := New(map[string][]config.Entry{"dev": {{Target: config.Target{BaseURL: "one"}, Models: nil}}})
+	route, _ := m.Select("Bearer dev")
+	if route.HasModels() {
+		t.Fatal("legacy token inspected for models")
+	}
+}
+
 func TestConcurrentSelection(t *testing.T) {
-	m := New(map[string][]config.Target{"dev": {{BaseURL: "1"}, {BaseURL: "2"}, {BaseURL: "3"}}})
+	m := New(map[string][]config.Entry{"dev": {
+		{Target: config.Target{BaseURL: "1"}},
+		{Target: config.Target{BaseURL: "2"}},
+		{Target: config.Target{BaseURL: "3"}},
+	}})
 	var counts [3]atomic.Int64
 	var wg sync.WaitGroup
 	for i := 0; i < 300; i++ {
 		wg.Go(func() {
-			target, ok := m.Select("Bearer dev")
+			route, ok := m.Select("Bearer dev")
 			if !ok {
 				t.Error("authentication failed")
 				return
 			}
+			target := route.RoundRobin()
 			counts[int(target.BaseURL[0]-'1')].Add(1)
 		})
 	}

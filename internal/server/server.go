@@ -19,19 +19,34 @@ func New(address string, keys *keymap.Map, logger *slog.Logger) *http.Server {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		started := time.Now()
 		response := &responseWriter{ResponseWriter: w}
-		target, ok := keys.Select(r.Header.Get("Authorization"))
+		route, ok := keys.Select(r.Header.Get("Authorization"))
+		targetURL, model := "", ""
 		defer func() {
 			status := response.status
 			if status == 0 {
 				status = http.StatusOK
 			}
-			logger.Info("request", "method", r.Method, "path", r.URL.Path,
-				"target", target.BaseURL, "status", status, "duration", time.Since(started))
+			fields := []any{"method", r.Method, "path", r.URL.Path,
+				"target", targetURL, "status", status, "duration", time.Since(started)}
+			if model != "" {
+				fields = append(fields, "model", model)
+			}
+			logger.Info("request", fields...)
 		}()
 		if !ok {
 			http.Error(response, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
+		target, matched, err := proxy.Prepare(r, route)
+		if err != nil {
+			status := http.StatusBadRequest
+			if errors.Is(err, proxy.ErrBodyTooLarge) {
+				status = http.StatusRequestEntityTooLarge
+			}
+			http.Error(response, http.StatusText(status), status)
+			return
+		}
+		targetURL, model = target.BaseURL, matched
 		forward.ServeHTTP(response, r.WithContext(keymap.WithTarget(r.Context(), target)))
 	})
 	return &http.Server{Addr: address, Handler: handler, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 90 * time.Second}

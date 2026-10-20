@@ -39,9 +39,9 @@ func TestAuthenticationRoutingAndLogs(t *testing.T) {
 	defer first.Close()
 	defer second.Close()
 	var logs bytes.Buffer
-	keys := keymap.New(map[string][]config.Target{"virtual": {
-		{BaseURL: first.URL, APIKey: "real-first"},
-		{BaseURL: second.URL, APIKey: "real-second"},
+	keys := keymap.New(map[string][]config.Entry{"virtual": {
+		{Target: config.Target{BaseURL: first.URL, APIKey: "real-first"}},
+		{Target: config.Target{BaseURL: second.URL, APIKey: "real-second"}},
 	}})
 	srv := New(config.DefaultListen, keys, slog.New(slog.NewJSONHandler(&logs, nil)))
 	if srv.WriteTimeout != 0 || srv.ReadTimeout != 0 || srv.Addr != config.DefaultListen {
@@ -98,6 +98,74 @@ func TestAuthenticationRoutingAndLogs(t *testing.T) {
 	}
 }
 
+func TestModelBasedRouting(t *testing.T) {
+	type record struct {
+		calls int
+		body  string
+	}
+	upstream := func(rec *record) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			rec.calls++
+			data, _ := io.ReadAll(r.Body)
+			rec.body = string(data)
+			w.WriteHeader(http.StatusOK)
+		}))
+	}
+	flashRec, proRec := &record{}, &record{}
+	flash, pro := upstream(flashRec), upstream(proRec)
+	defer flash.Close()
+	defer pro.Close()
+	var logs bytes.Buffer
+	keys := keymap.New(map[string][]config.Entry{"virtual": {
+		{Target: config.Target{BaseURL: flash.URL, APIKey: "real-flash"}, Models: []config.Model{{ID: "mimo-v2.6-flash", Name: "mimo-v2.6-flash"}}},
+		{Target: config.Target{BaseURL: pro.URL, APIKey: "real-pro"}, Models: []config.Model{{ID: "alias-pro", Name: "mimo-v2.6-pro"}}},
+	}})
+	srv := New(config.DefaultListen, keys, slog.New(slog.NewJSONHandler(&logs, nil)))
+	send := func(method, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(method, "/v1/chat/completions", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer virtual")
+		w := httptest.NewRecorder()
+		srv.Handler.ServeHTTP(w, req)
+		return w
+	}
+	// The model id picks the entry; the alias is rewritten to the provider name.
+	if w := send("POST", `{"model":"mimo-v2.6-flash","n":1}`); w.Code != 200 || flashRec.calls != 1 || proRec.calls != 0 {
+		t.Fatalf("flash routing: %d, calls %d/%d", w.Code, flashRec.calls, proRec.calls)
+	}
+	if flashRec.body != `{"model":"mimo-v2.6-flash","n":1}` {
+		t.Fatalf("flash body = %q", flashRec.body)
+	}
+	if w := send("POST", `{"model":"alias-pro"}`); w.Code != 200 || proRec.calls != 1 || flashRec.calls != 1 {
+		t.Fatalf("pro routing: %d, calls %d/%d", w.Code, flashRec.calls, proRec.calls)
+	}
+	if proRec.body != `{"model":"mimo-v2.6-pro"}` {
+		t.Fatalf("pro body = %q (alias not rewritten)", proRec.body)
+	}
+	// An unknown model id is rejected without contacting an upstream.
+	if w := send("POST", `{"model":"typo"}`); w.Code != 400 || flashRec.calls+proRec.calls != 2 {
+		t.Fatalf("unknown model: %d, calls %d/%d", w.Code, flashRec.calls, proRec.calls)
+	}
+	// Requests without a resolvable model fall back to round-robin untouched.
+	for _, want := range []*record{flashRec, proRec} {
+		before := want.calls
+		if w := send("GET", ""); w.Code != 200 || want.calls != before+1 {
+			t.Fatalf("model-less request: %d, calls %d/%d", w.Code, flashRec.calls, proRec.calls)
+		}
+	}
+	// The log carries the model id only for matched requests.
+	for i, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		var fields map[string]any
+		if err := json.Unmarshal([]byte(line), &fields); err != nil {
+			t.Fatal(err)
+		}
+		_, logged := fields["model"]
+		if want := i < 2; logged != want {
+			t.Fatalf("line %d model logging = %v: %s", i, logged, line)
+		}
+	}
+}
+
 func TestNoFailover(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -111,7 +179,7 @@ func TestNoFailover(t *testing.T) {
 		w.WriteHeader(204)
 	}))
 	defer healthy.Close()
-	keys := keymap.New(map[string][]config.Target{"virtual": {{BaseURL: deadURL}, {BaseURL: healthy.URL}}})
+	keys := keymap.New(map[string][]config.Entry{"virtual": {{Target: config.Target{BaseURL: deadURL}}, {Target: config.Target{BaseURL: healthy.URL}}}})
 	srv := New("", keys, slog.New(slog.NewJSONHandler(io.Discard, nil)))
 	for i, want := range []int{502, 204} {
 		req := httptest.NewRequest("GET", "/anything", nil)
@@ -138,7 +206,7 @@ func TestStreamingThroughLogging(t *testing.T) {
 		_, _ = io.WriteString(w, "data: last\n\n")
 	}))
 	defer upstream.Close()
-	srv := New("", keymap.New(map[string][]config.Target{"virtual": {{BaseURL: upstream.URL}}}), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	srv := New("", keymap.New(map[string][]config.Entry{"virtual": {{Target: config.Target{BaseURL: upstream.URL}}}}), slog.New(slog.NewJSONHandler(io.Discard, nil)))
 	gateway := httptest.NewServer(srv.Handler)
 	defer gateway.Close()
 	defer close(release)

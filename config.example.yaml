@@ -4,6 +4,13 @@ keys:
     target:
       base_url: https://api.openai.com
       api_key: sk-real-replace-me
+    # Optional: the models this entry serves. "id" is the model name callers
+    # send in their requests, "name" is the model name the provider receives.
+    models:
+      - id: mimo-v2.6-flash
+        name: mimo-v2.6-flash
+      - id: mimo-v2.6-pro
+        name: mimo-v2.6-pro
   # Repeat a token to round-robin across compatible upstreams.
   # api_key is optional for upstreams that do not require authentication.
   - token: sk-virt-local

@@ -36,9 +36,23 @@ type Target struct {
 	APIKey  string `yaml:"api_key"`
 }
 
+// Model maps the model name a caller uses (ID) to the name the provider
+// receives (Name).
+type Model struct {
+	ID   string `yaml:"id"`
+	Name string `yaml:"name"`
+}
+
+// Entry is one configured occurrence of a virtual key: its target and the
+// models that target serves.
+type Entry struct {
+	Target Target
+	Models []Model
+}
+
 type Config struct {
 	Listen string
-	Keys   map[string][]Target
+	Keys   map[string][]Entry
 }
 
 func Load(path string) (*Config, error) {
@@ -60,8 +74,9 @@ func Parse(data []byte) (*Config, error) {
 	var raw struct {
 		Listen string `yaml:"listen"`
 		Keys   []struct {
-			Token  string `yaml:"token"`
-			Target Target `yaml:"target"`
+			Token  string  `yaml:"token"`
+			Target Target  `yaml:"target"`
+			Models []Model `yaml:"models"`
 		} `yaml:"keys"`
 	}
 	if err := doc.Decode(&raw); err != nil {
@@ -70,7 +85,7 @@ func Parse(data []byte) (*Config, error) {
 	if len(raw.Keys) == 0 {
 		return nil, fmt.Errorf("config: keys must not be empty")
 	}
-	cfg := &Config{Listen: raw.Listen, Keys: make(map[string][]Target)}
+	cfg := &Config{Listen: raw.Listen, Keys: make(map[string][]Entry)}
 	if cfg.Listen == "" {
 		cfg.Listen = DefaultListen
 	}
@@ -87,9 +102,38 @@ func Parse(data []byte) (*Config, error) {
 			return nil, fmt.Errorf("line %d: keys[%d].target.base_url must be an http(s) origin without credentials, path, query or fragment", field(targetNode, "base_url").Line, i)
 		}
 		entry.Target.BaseURL = base
-		cfg.Keys[entry.Token] = append(cfg.Keys[entry.Token], entry.Target)
+		models, err := validateModels(field(node, "models"), entry.Token, cfg.Keys[entry.Token], entry.Models, i)
+		if err != nil {
+			return nil, err
+		}
+		cfg.Keys[entry.Token] = append(cfg.Keys[entry.Token], Entry{Target: entry.Target, Models: models})
 	}
 	return cfg, nil
+}
+
+// validateModels checks one entry's models against the token's already accepted
+// entries: id and name must be non-empty, and id must be unique per token.
+func validateModels(node *yaml.Node, token string, prior []Entry, models []Model, keyIndex int) ([]Model, error) {
+	seen := make(map[string]struct{})
+	for _, entry := range prior {
+		for _, model := range entry.Models {
+			seen[model.ID] = struct{}{}
+		}
+	}
+	for j, model := range models {
+		item := node.Content[j]
+		if strings.TrimSpace(model.ID) == "" {
+			return nil, fmt.Errorf("line %d: keys[%d].models[%d].id is required", field(item, "id").Line, keyIndex, j)
+		}
+		if strings.TrimSpace(model.Name) == "" {
+			return nil, fmt.Errorf("line %d: keys[%d].models[%d].name is required", field(item, "name").Line, keyIndex, j)
+		}
+		if _, dup := seen[model.ID]; dup {
+			return nil, fmt.Errorf("line %d: keys[%d].models[%d].id %q is already declared for token %q", field(item, "id").Line, keyIndex, j, model.ID, token)
+		}
+		seen[model.ID] = struct{}{}
+	}
+	return models, nil
 }
 
 // Missing fields use the enclosing mapping's line for actionable errors.
