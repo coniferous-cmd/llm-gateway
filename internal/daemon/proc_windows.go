@@ -24,12 +24,17 @@ func Alive(pid int) bool {
 	if pid <= 0 {
 		return false
 	}
-	process, err := os.FindProcess(pid)
+	// Opening a process only fails once no handle to it exists anywhere, so an
+	// exited process still reachable through a foreign handle (runners and
+	// antivirus hold such handles briefly) would look alive. An exit wait with a
+	// zero timeout is the only reliable answer: WAIT_TIMEOUT means running.
+	handle, err := syscall.OpenProcess(syscall.SYNCHRONIZE, false, uint32(pid))
 	if err != nil {
 		return false
 	}
-	defer process.Release()
-	return true
+	defer syscall.CloseHandle(handle)
+	event, err := syscall.WaitForSingleObject(handle, 0)
+	return err == nil && event == syscall.WAIT_TIMEOUT
 }
 
 // terminate ends the process immediately; Windows offers no cross-process
