@@ -20,8 +20,8 @@ jobs:
     name: Test and vet
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
@@ -37,12 +37,16 @@ jobs:
       matrix:
         goos: [linux, windows, darwin]
         goarch: [amd64, arm64]
+        include:
+          # 32-bit ARM (Raspberry Pi and similar); no windows/darwin/arm target.
+          - goos: linux
+            goarch: arm
     env:
       GOOS: ${{ matrix.goos }}
       GOARCH: ${{ matrix.goarch }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
@@ -68,7 +72,7 @@ jobs:
           fi
           echo "archive=dist/$archive" >> "$GITHUB_OUTPUT"
       - name: Upload binary archive
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: llm-gateway-${{ matrix.goos }}-${{ matrix.goarch }}
           path: ${{ steps.package.outputs.archive }}
@@ -83,7 +87,7 @@ jobs:
       contents: write
     steps:
       - name: Download binary archives
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           pattern: llm-gateway-*
           path: dist

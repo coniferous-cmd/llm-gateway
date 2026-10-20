@@ -25,7 +25,7 @@ help:
 	@echo make vet         - Run go vet
 	@echo make fmt         - Format Go source
 	@echo make check       - Run tests and vet
-	@echo make build-all   - Build Windows, Linux and macOS for amd64 and arm64
+	@echo make build-all   - Build Windows, Linux and macOS for amd64 and arm64, plus Linux arm
 	@echo Override config: make run CONFIG=./config.example.yaml
 
 build:
@@ -71,5 +71,6 @@ $(eval $(call platform,windows,amd64,.exe))
 $(eval $(call platform,windows,arm64,.exe))
 $(eval $(call platform,linux,amd64,))
 $(eval $(call platform,linux,arm64,))
+$(eval $(call platform,linux,arm,))
 $(eval $(call platform,darwin,amd64,))
 $(eval $(call platform,darwin,arm64,))
