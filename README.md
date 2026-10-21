@@ -126,7 +126,22 @@ Press Ctrl+C to shut down; SIGTERM is also supported on POSIX systems. After a s
 - `--stop` shuts the gateway down and removes the pid file. On POSIX systems it receives SIGTERM and gets the same 10-second drain as Ctrl+C before being killed; on Windows it is terminated immediately and in-flight requests are cut.
 - Only one gateway can hold a pid file: starting a second one reports `already running`, and `--stop` with no running gateway reports `not running` and exits non-zero.
 - `--log-file` and `--pid-file` also work in the foreground. A foreground instance only records a pid file when `--pid-file` is given explicitly, and then `--stop` can shut it down too.
-- This is process detachment, not a system service: nothing starts the gateway on boot or restarts it after a crash — use systemd, launchd or Windows service tooling for that. Like any pid-file scheme, `--stop` trusts the recorded pid; if the operating system has recycled that pid for an unrelated process, that process is targeted.
+- This is process detachment, not a system service: nothing starts the gateway on boot or restarts it after a crash — use systemd, launchd or the Windows service script described below. Like any pid-file scheme, `--stop` trusts the recorded pid; if the operating system has recycled that pid for an unrelated process, that process is targeted.
+
+### Windows service
+
+The binary has no native Windows service (SCM) integration, so `scripts\service-win.bat` wraps it with [NSSM](https://nssm.cc). It needs an Administrator prompt (it requests elevation itself); `nssm.exe` is picked up from `bin\`, then from `PATH`, and otherwise downloaded automatically:
+
+```bat
+scripts\service-win.bat install                :: uses .\config.yaml if present
+scripts\service-win.bat install C:\path\to\config.yaml
+scripts\service-win.bat status
+scripts\service-win.bat stop
+scripts\service-win.bat uninstall
+```
+
+- `install` registers `llm-gateway` as an auto-start service and starts it immediately. The config path is optional: an explicit argument wins, then the repo's `config.yaml`, then `~/.config/llm-gateway/config.yaml`; with none of those the gateway falls back to the LocalSystem home directory and the script warns.
+- The gateway runs in the foreground under NSSM, which captures its JSON stdout into rotating files under `%ProgramData%\llm-gateway\` (10 MB per file) and restarts it if it exits. `stop` sends the usual shutdown signal and allows the 10-second request drain to finish.
 
 ### Docker
 
