@@ -2,7 +2,7 @@
 
 A lightweight, locally running LLM gateway: callers only store virtual keys; the gateway picks the upstream and swaps `Authorization`. It does not convert protocols, count tokens, retry, fail over, or hot-reload configuration. Request bodies pass through untouched, with one optional exception: [model routing](#model-routing) reads — and possibly rewrites — the top-level `model` field of JSON request bodies.
 
-Supports Windows, Linux, macOS (amd64 / arm64). The release is a single binary with no dependency on Go, Node.js, Python, or a C compiler; the config file is supplied separately. The only third-party Go dependency is `gopkg.in/yaml.v3`, used to parse YAML at startup.
+Supports Windows, Linux, macOS (amd64 / arm64). The release is a single binary with no dependency on Go, Node.js, Python, or a C compiler; the config file is supplied separately. The third-party Go dependencies are `gopkg.in/yaml.v3` (config parsing) and `github.com/flynn/noise` (the Noise protocol, used only for the optional gateway-to-gateway encrypted channel).
 
 ## Download
 
@@ -95,6 +95,70 @@ keys:
 - A token whose entries declare no `models` keeps the original behavior exactly: request bodies are never read.
 - `id` values must be unique within one token (a duplicate is a startup error); the same `id` under different tokens is fine.
 - This is the only place the gateway reads request bodies. On model-enabled tokens bodies are buffered in memory (up to 32 MiB; beyond that the request is rejected with `413 Request Entity Too Large`), and bodies with a non-identity `Content-Encoding` pass through uninspected and unmodified.
+
+### Encrypted gateway-to-gateway links (e2ee)
+
+Gateways can be chained — gateway B forwards to gateway C, which forwards to the provider. Without protection, that hop carries the URL, request body and the real provider key in plaintext across whatever network sits between the machines. The optional `e2ee` section encrypts **exactly that hop**: the entire TCP byte stream between two gateways is sealed with the Noise IK protocol (X25519 identity keys, per-connection forward-secret session keys). The client→gateway and gateway→provider links are unchanged (plain HTTP / standard HTTPS); only gateway↔gateway traffic is encrypted. HTTP semantics are untouched, so SSE streaming still arrives chunk by chunk through the encrypted link.
+
+```
+client ──plain HTTP──► gateway B ══Noise IK encrypted══► gateway C ──plain HTTPS──► provider
+                      (virtual key)   URL+body+auth密文     (swaps to real key)
+```
+
+There are no client/server roles: every gateway runs the same shape (its own listener, its own identity, a list of pinned peers) and either side can initiate encrypted calls to the other.
+
+**Setup** — on each gateway, generate an identity and exchange public keys out of band (a chat message, not the network):
+
+```sh
+llm-gateway --keygen
+# identity_key: <base64, stays on THIS machine, never share>
+# identity_pub:  <base64, give this to the peer operator>
+```
+
+Gateway B's config (calling C):
+
+```yaml
+listen: "0.0.0.0:8080"       # clients connect here, plain HTTP
+e2ee:
+  listen: "0.0.0.0:8081"     # peers connect here, Noise-encrypted
+  identity_key: "<B's private key from --keygen>"
+  peers:
+    - name: gateway-c
+      base_url: "http://C.example.com:8081"   # C's e2ee.listen address
+      identity_pub: "<C's public key>"
+keys:
+  - token: sk-virt-from-client
+    target:
+      peer: gateway-c        # forward over the encrypted link
+      api_key: sk-virt-on-c  # the virtual key C accepts
+```
+
+Gateway C's config (receiving from B, forwarding to the provider):
+
+```yaml
+listen: "0.0.0.0:8080"
+e2ee:
+  listen: "0.0.0.0:8081"
+  identity_key: "<C's private key>"
+  peers:
+    - name: gateway-b
+      base_url: "http://B.example.com:8081"
+      identity_pub: "<B's public key>"
+keys:
+  - token: sk-virt-on-c          # matches B's target.api_key
+    target:
+      base_url: https://api.openai.com
+      api_key: sk-real-provider
+```
+
+Rules and guarantees:
+
+- `target.peer` and `target.base_url` are mutually exclusive; `peer` must name a declared `e2ee.peers` entry, and startup validation rejects a peer address that collides with any plaintext `base_url`.
+- **Identity pinning is the trust anchor.** Each side pins the other's public key in config; a handshake with any other key (including an active man-in-the-middle on the public internet) fails immediately and no application data is exchanged. Exchange public keys out of band, exactly like exchanging the `api_key` values.
+- Every TCP connection performs one handshake; requests on that connection (HTTP keep-alive) reuse the session. Sessions are forward-secret: compromising a long-term identity key does not decrypt recorded past traffic.
+- **Firewall the e2ee port.** The handshake rejects unknown identities, but the port should still only accept TCP from known peer addresses (security groups / `ufw` / firewall rules). It binds to loopback by default; set it explicitly for cross-machine links.
+- **Key rotation:** generate a new `--keygen` pair, update the peer's `identity_pub` on the other side and this machine's `identity_key`, then restart both gateways. There is no key distribution or revocation mechanism — config is the source of truth.
+- Private keys never appear in logs; a rejected handshake logs the remote address and the failure only.
 
 ## Running
 

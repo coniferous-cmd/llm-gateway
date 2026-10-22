@@ -83,6 +83,33 @@ func TestLegacyTokenHasNoModels(t *testing.T) {
 	}
 }
 
+func TestPeerTargetPassthrough(t *testing.T) {
+	peerTarget := config.Target{BaseURL: "http://peer:8081", APIKey: "sk-virt-peer", Peer: "gateway-c"}
+	m := New(map[string][]config.Entry{"dev": {
+		{Target: peerTarget, Models: []config.Model{{ID: "f", Name: "f-real"}}},
+		{Target: config.Target{BaseURL: "http://plain"}},
+	}})
+	route, ok := m.Select("Bearer dev")
+	if !ok {
+		t.Fatal("token not found")
+	}
+	// Model-matched resolution must carry the Peer marker.
+	target, _, ok := route.Resolve("f")
+	if !ok || target.Peer != "gateway-c" || target.BaseURL != "http://peer:8081" {
+		t.Fatalf("Resolve lost peer marker: %+v", target)
+	}
+	// Round-robin (entry 0 is the peer) must too.
+	if got := route.RoundRobin(); got.Peer != "gateway-c" {
+		t.Fatalf("RoundRobin lost peer marker: %+v", got)
+	}
+	// Context handoff must preserve it end to end.
+	ctx := WithTarget(t.Context(), target)
+	got, ok := TargetFromContext(ctx)
+	if !ok || got.Peer != "gateway-c" {
+		t.Fatalf("context handoff lost peer marker: %+v", got)
+	}
+}
+
 func TestConcurrentSelection(t *testing.T) {
 	m := New(map[string][]config.Entry{"dev": {
 		{Target: config.Target{BaseURL: "1"}},

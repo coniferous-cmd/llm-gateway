@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -15,7 +17,9 @@ import (
 
 	"llm-gateway/internal/config"
 	"llm-gateway/internal/daemon"
+	"llm-gateway/internal/e2ee"
 	"llm-gateway/internal/keymap"
+	"llm-gateway/internal/proxy"
 	"llm-gateway/internal/server"
 )
 
@@ -32,7 +36,15 @@ func main() {
 	logPath := flag.String("log-file", "", "append logs to this file instead of stdout (default with --daemon: ~/.config/llm-gateway/llm-gateway.log)")
 	pidPath := flag.String("pid-file", "", "path to the pid file (default ~/.config/llm-gateway/llm-gateway.pid)")
 	versionFlag := flag.Bool("version", false, "print version and exit")
+	keygenFlag := flag.Bool("keygen", false, "generate an e2ee identity keypair and exit")
 	flag.Parse()
+	if *keygenFlag {
+		if err := e2ee.GenerateKeyPair(os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, "keygen failed:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if *versionFlag {
 		fmt.Println("llm-gateway", version)
 		return
@@ -109,12 +121,70 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	srv := server.New(cfg.Listen, keymap.New(cfg.Keys), logger)
+	keys := keymap.New(cfg.Keys)
+	// e2ee: parse identity, build the peer dial table for the client-facing
+	// proxy, and listen for encrypted connections from peer gateways.
+	var peers map[string]proxy.PeerDialer
+	var e2eeSrv *http.Server
+	var e2eeLn net.Listener
+	if cfg.E2EE != nil {
+		identity, peersTable, allowed, err := buildE2EE(cfg, logger)
+		if err != nil {
+			logger.Error("configuration failed", "error", err)
+			os.Exit(1)
+		}
+		peers = make(map[string]proxy.PeerDialer, len(peersTable))
+		for addr, dialer := range peersTable {
+			peers[addr] = dialer
+		}
+		e2eeLn, err = net.Listen("tcp", cfg.E2EE.Listen)
+		if err != nil {
+			logger.Error("e2ee listen failed", "error", err, "listen", cfg.E2EE.Listen)
+			os.Exit(1)
+		}
+		wrapped := e2ee.NewListener(e2eeLn, identity, allowed, logger)
+		e2eeSrv = server.NewWithPeers(cfg.E2EE.Listen, keys, logger, peers)
+		logger.Info("e2ee listening", "listen", cfg.E2EE.Listen, "peers", len(cfg.E2EE.Peers))
+		go func() {
+			if err := server.Serve(ctx, e2eeSrv, wrapped); err != nil {
+				logger.Error("e2ee server failed", "error", err)
+				stop()
+			}
+		}()
+	}
+	srv := server.NewWithPeers(cfg.Listen, keys, logger, peers)
 	logger.Info("starting", "listen", cfg.Listen, "version", version)
 	if err := server.Run(ctx, srv); err != nil {
 		logger.Error("server failed", "error", err)
 		os.Exit(1)
 	}
+}
+
+// buildE2EE parses the configured identity and builds one Noise dialer per
+// peer, keyed by the peer's host:port so the proxy transport can match on the
+// destination address alone. The returned allowlist maps peer names to their
+// pinned public keys for the inbound listener.
+func buildE2EE(cfg *config.Config, logger *slog.Logger) (*e2ee.Identity, map[string]*e2ee.Dialer, map[string][]byte, error) {
+	identity, err := e2ee.ParseIdentity(cfg.E2EE.IdentityKey)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("e2ee.identity_key: %w", err)
+	}
+	dialers := make(map[string]*e2ee.Dialer, len(cfg.E2EE.Peers))
+	allowed := make(map[string][]byte, len(cfg.E2EE.Peers))
+	for _, p := range cfg.E2EE.Peers {
+		pub, err := e2ee.ParsePublicKey(p.IdentityPub)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("e2ee peer %q identity_pub: %w", p.Name, err)
+		}
+		u, err := url.Parse(p.BaseURL) // Validated once at startup.
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("e2ee peer %q base_url: %w", p.Name, err)
+		}
+		dialers[u.Host] = e2ee.NewDialer(identity, map[string][]byte{u.Host: pub})
+		allowed[p.Name] = pub
+		logger.Info("e2ee peer configured", "peer", p.Name, "address", u.Host)
+	}
+	return identity, dialers, allowed, nil
 }
 
 // runBackground validates the config, relaunches the binary detached and waits

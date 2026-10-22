@@ -15,7 +15,16 @@ import (
 )
 
 func New(address string, keys *keymap.Map, logger *slog.Logger) *http.Server {
-	forward := proxy.New()
+	return NewWithPeers(address, keys, logger, nil)
+}
+
+// NewWithPeers builds the HTTP server for the client-facing (or e2ee) listen
+// address with the same handler pipeline. peers wires the proxy transport to
+// Noise dialers for e2ee destinations; nil means plaintext only. The e2ee
+// listener reuses this identical handler so decrypted peer requests flow
+// through the exact same auth, logging and forwarding path as local callers.
+func NewWithPeers(address string, keys *keymap.Map, logger *slog.Logger, peers map[string]proxy.PeerDialer) *http.Server {
+	forward := proxy.New(peers)
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		started := time.Now()
 		response := &responseWriter{ResponseWriter: w}
@@ -54,8 +63,18 @@ func New(address string, keys *keymap.Map, logger *slog.Logger) *http.Server {
 
 // Run waits for shutdown and drains active requests, including streams, for 10s.
 func Run(ctx context.Context, srv *http.Server) error {
+	return run(ctx, srv, srv.ListenAndServe)
+}
+
+// Serve runs the server on an already-listening socket (e.g. an e2ee-wrapped
+// listener) with the same drain semantics as Run.
+func Serve(ctx context.Context, srv *http.Server, ln net.Listener) error {
+	return run(ctx, srv, func() error { return srv.Serve(ln) })
+}
+
+func run(ctx context.Context, srv *http.Server, serve func() error) error {
 	done := make(chan error, 1)
-	go func() { done <- srv.ListenAndServe() }()
+	go func() { done <- serve() }()
 	select {
 	case err := <-done:
 		if errors.Is(err, http.ErrServerClosed) {

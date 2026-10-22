@@ -1,4 +1,17 @@
 listen: "127.0.0.1:8080"
+
+# Optional: encrypted gateway-to-gateway channel (Noise IK over X25519).
+# Generate the identity with `llm-gateway --keygen`; keep identity_key secret
+# on this machine and hand identity_pub to the peer operator out of band.
+# Remove this whole section if this gateway never talks to another gateway.
+#e2ee:
+#  listen: "0.0.0.0:8081" # encrypted peer port; firewall it to known peers
+#  identity_key: "REPLACE-with-llm-gateway---keygen-output"
+#  peers:
+#    - name: gateway-c
+#      base_url: "http://10.0.0.2:8081" # the peer's e2ee.listen address
+#      identity_pub: "REPLACE-with-the-peers-identity_pub"
+
 keys:
   - token: sk-virt-dev
     target:
@@ -16,3 +29,10 @@ keys:
   - token: sk-virt-local
     target:
       base_url: http://127.0.0.1:11434/
+  # Forward over the encrypted link to a peer gateway instead of a plain
+  # upstream: `peer` names an entry in e2ee.peers (mutually exclusive with
+  # base_url). api_key is the virtual key the *peer* gateway accepts.
+  #- token: sk-virt-through-c
+  #  target:
+  #    peer: gateway-c
+  #    api_key: sk-virt-on-gateway-c

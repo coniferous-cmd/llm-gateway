@@ -19,7 +19,7 @@ import (
 
 func gateway(t *testing.T, target config.Target) *httptest.Server {
 	t.Helper()
-	p := New()
+	p := New(nil)
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p.ServeHTTP(w, r.WithContext(keymap.WithTarget(r.Context(), target)))
 	}))
@@ -170,5 +170,82 @@ func TestNoRetry(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != 502 || attempts.Load() != 1 {
 		t.Fatal(resp.Status, attempts.Load())
+	}
+}
+
+func TestPeerForwardingOverE2EE(t *testing.T) {
+	// Upstream lives behind the peer gateway's e2ee listener: the peer
+	// decrypts the Noise stream and serves plain HTTP from it.
+	var gotAuth, gotPath string
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth, gotPath = r.Header.Get("Authorization"), r.URL.RequestURI()
+		w.WriteHeader(http.StatusTeapot)
+		_, _ = w.Write([]byte("behind peer"))
+	})
+	clientID, peerID, err := e2eeIdentities()
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerAddr, stop := startE2EEServer(t, peerID, map[string][]byte{"client": clientID.Public.Public}, upstream)
+	defer stop()
+	dialer := e2eeDialer(clientID, peerAddr, peerID.Public.Public)
+	s := gatewayWithPeers(t, config.Target{BaseURL: "http://" + peerAddr, APIKey: "sk-to-peer", Peer: "peer"},
+		map[string]PeerDialer{peerAddr: dialer})
+	resp, err := http.Post(s.URL+"/v1/chat?q=1", "application/json", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusTeapot || string(body) != "behind peer" {
+		t.Fatalf("status=%d body=%q", resp.StatusCode, body)
+	}
+	if gotAuth != "Bearer sk-to-peer" || gotPath != "/v1/chat?q=1" {
+		t.Fatalf("upstream saw auth=%q path=%q", gotAuth, gotPath)
+	}
+}
+
+// SSE through the encrypted hop must keep chunk-by-chunk flushing: the client
+// receives the first event while the upstream is still streaming, proving the
+// Noise session does not buffer the whole response.
+func TestSSEStreamingOverE2EE(t *testing.T) {
+	release := make(chan struct{})
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: first\n\n")
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		_, _ = io.WriteString(w, "data: second\n\n")
+	})
+	defer close(release)
+	clientID, peerID, err := e2eeIdentities()
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerAddr, stop := startE2EEServer(t, peerID, map[string][]byte{"client": clientID.Public.Public}, upstream)
+	defer stop()
+	dialer := e2eeDialer(clientID, peerAddr, peerID.Public.Public)
+	s := gatewayWithPeers(t, config.Target{BaseURL: "http://" + peerAddr, APIKey: "sk-virt", Peer: "peer"},
+		map[string]PeerDialer{peerAddr: dialer})
+	resp, err := http.Get(s.URL + "/stream")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	reader := bufio.NewReader(resp.Body)
+	line, err := reader.ReadString('\n')
+	if err != nil || line != "data: first\n" {
+		t.Fatalf("first chunk did not arrive before upstream completion: %q %v", line, err)
+	}
+	// The upstream cannot finish until this point; receiving the first event
+	// proves the encrypted hop flushed it immediately.
+	release <- struct{}{}
+	rest, err := io.ReadAll(reader)
+	if err != nil || !strings.Contains(string(rest), "data: second\n") {
+		t.Fatalf("second chunk: %q %v", rest, err)
 	}
 }

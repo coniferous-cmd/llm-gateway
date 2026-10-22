@@ -2,6 +2,7 @@
 package proxy
 
 import (
+	"context"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -11,9 +12,26 @@ import (
 	"llm-gateway/internal/keymap"
 )
 
-func New() http.Handler {
+// PeerDialer opens an encrypted connection to a peer gateway. It matches
+// net.Dialer.DialContext so the e2ee dialer plugs in directly.
+type PeerDialer interface {
+	DialContext(ctx context.Context, network, addr string) (net.Conn, error)
+}
+
+// New builds the forwarding handler. peers maps "host:port" (a peer's e2ee
+// listen address) to the dialer that wraps the connection in a Noise session;
+// nil or empty means every upstream is reached over plaintext. The transport
+// decides purely by destination address, which startup validation keeps free
+// of collisions between peer and plaintext addresses.
+func New(peers map[string]PeerDialer) http.Handler {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.DialContext = (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+	base := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if peer, ok := peers[addr]; ok {
+			return peer.DialContext(ctx, network, addr)
+		}
+		return base.DialContext(ctx, network, addr)
+	}
 	transport.MaxIdleConnsPerHost = 16
 	transport.ResponseHeaderTimeout = 30 * time.Second
 	// Do not add Accept-Encoding or transparently decompress upstream responses.

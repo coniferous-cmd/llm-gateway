@@ -131,3 +131,152 @@ func TestLoad(t *testing.T) {
 		t.Fatal(cfg)
 	}
 }
+
+// 32-byte base64 keys; the config parser checks shape, not key validity.
+const (
+	testIdentityKey  = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	testIdentityPubA = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
+	testIdentityPubB = "AgICAgICAgICAgICAgICAgAgICAgICAgICAgICAgICAg="
+)
+
+func TestParseE2EE(t *testing.T) {
+	const prefix = "e2ee:\n" +
+		"  listen: \"0.0.0.0:9081\"\n" +
+		"  identity_key: " + testIdentityKey + "\n" +
+		"  peers:\n" +
+		"    - name: gateway-c\n" +
+		"      base_url: \"http://10.0.0.2:9081\"\n" +
+		"      identity_pub: " + testIdentityPubA + "\n"
+
+	t.Run("valid peer target", func(t *testing.T) {
+		yaml := prefix + "keys:\n  - token: dev\n    target:\n      peer: gateway-c\n      api_key: sk-virt\n"
+		cfg, err := Parse([]byte(yaml))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.E2EE == nil || cfg.E2EE.Listen != "0.0.0.0:9081" || len(cfg.E2EE.Peers) != 1 {
+			t.Fatalf("e2ee = %+v", cfg.E2EE)
+		}
+		target := cfg.Keys["dev"][0].Target
+		if target.Peer != "gateway-c" || target.BaseURL != "http://10.0.0.2:9081" {
+			t.Fatalf("target must resolve peer to its base_url: %+v", target)
+		}
+	})
+
+	t.Run("valid plaintext target alongside e2ee", func(t *testing.T) {
+		yaml := prefix + "keys:\n  - token: dev\n    target:\n      base_url: \"https://api.openai.com\"\n"
+		cfg, err := Parse([]byte(yaml))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Keys["dev"][0].Target.Peer != "" {
+			t.Fatal("plaintext target must not carry a peer")
+		}
+	})
+
+	t.Run("no e2ee section still valid", func(t *testing.T) {
+		yaml := "keys:\n  - token: dev\n    target:\n      base_url: https://example.com\n"
+		cfg, err := Parse([]byte(yaml))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.E2EE != nil {
+			t.Fatal("E2EE must be nil when not configured")
+		}
+	})
+
+	t.Run("base_url and peer mutually exclusive", func(t *testing.T) {
+		yaml := prefix + "keys:\n  - token: dev\n    target:\n      base_url: \"https://x.com\"\n      peer: gateway-c\n"
+		if _, err := Parse([]byte(yaml)); err == nil || !strings.Contains(err.Error(), "exactly one of base_url or peer") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+
+	t.Run("neither base_url nor peer", func(t *testing.T) {
+		yaml := "keys:\n  - token: dev\n    target:\n      api_key: k\n"
+		if _, err := Parse([]byte(yaml)); err == nil || !strings.Contains(err.Error(), "must set one of base_url or peer") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+
+	t.Run("undeclared peer reference", func(t *testing.T) {
+		yaml := prefix + "keys:\n  - token: dev\n    target:\n      peer: ghost\n"
+		if _, err := Parse([]byte(yaml)); err == nil || !strings.Contains(err.Error(), "not declared in e2ee.peers") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+
+	t.Run("peer target without e2ee section", func(t *testing.T) {
+		yaml := "keys:\n  - token: dev\n    target:\n      peer: gateway-c\n"
+		if _, err := Parse([]byte(yaml)); err == nil || !strings.Contains(err.Error(), "not declared in e2ee.peers") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+
+	t.Run("missing identity_key", func(t *testing.T) {
+		yaml := "e2ee:\n  listen: \":9081\"\nkeys:\n  - token: dev\n    target:\n      base_url: https://example.com\n"
+		if _, err := Parse([]byte(yaml)); err == nil || !strings.Contains(err.Error(), "e2ee.identity_key is required") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+
+	t.Run("malformed identity_key", func(t *testing.T) {
+		bad := strings.Replace(prefix, testIdentityKey, "short", 1)
+		bad += "keys:\n  - token: dev\n    target:\n      base_url: https://example.com\n"
+		if _, err := Parse([]byte(bad)); err == nil || !strings.Contains(err.Error(), "identity_key must be") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+
+	t.Run("malformed identity_pub", func(t *testing.T) {
+		bad := strings.Replace(prefix, testIdentityPubA, "nope!", 1)
+		bad += "keys:\n  - token: dev\n    target:\n      base_url: https://example.com\n"
+		if _, err := Parse([]byte(bad)); err == nil || !strings.Contains(err.Error(), "identity_pub must be") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+
+	t.Run("duplicate peer name", func(t *testing.T) {
+		yaml := "e2ee:\n" +
+			"  identity_key: " + testIdentityKey + "\n" +
+			"  peers:\n" +
+			"    - name: gateway-c\n      base_url: \"http://10.0.0.2:9081\"\n      identity_pub: " + testIdentityPubA + "\n" +
+			"    - name: gateway-c\n      base_url: \"http://10.0.0.3:9081\"\n      identity_pub: " + testIdentityPubB + "\n" +
+			"keys:\n  - token: dev\n    target:\n      base_url: https://example.com\n"
+		if _, err := Parse([]byte(yaml)); err == nil || !strings.Contains(err.Error(), "duplicated") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+
+	t.Run("peer address collides with plaintext target", func(t *testing.T) {
+		yaml := "e2ee:\n" +
+			"  identity_key: " + testIdentityKey + "\n" +
+			"  peers:\n" +
+			"    - name: gateway-c\n      base_url: \"http://10.0.0.2:9081\"\n      identity_pub: " + testIdentityPubA + "\n" +
+			"keys:\n  - token: dev\n    target:\n      base_url: http://10.0.0.2:9081\n"
+		if _, err := Parse([]byte(yaml)); err == nil || !strings.Contains(err.Error(), "collides") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+
+	t.Run("error line numbers", func(t *testing.T) {
+		yaml := prefix + "keys:\n  - token: dev\n    target:\n      peer: ghost\n"
+		_, err := Parse([]byte(yaml))
+		if err == nil || !strings.HasPrefix(err.Error(), "line 11:") {
+			t.Fatalf("error = %v, want line 11", err)
+		}
+	})
+
+	t.Run("default e2ee listen", func(t *testing.T) {
+		yaml := "e2ee:\n" +
+			"  identity_key: " + testIdentityKey + "\n" +
+			"keys:\n  - token: dev\n    target:\n      base_url: https://example.com\n"
+		cfg, err := Parse([]byte(yaml))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.E2EE.Listen != DefaultE2EEListen {
+			t.Fatalf("listen = %q, want %q", cfg.E2EE.Listen, DefaultE2EEListen)
+		}
+	})
+}

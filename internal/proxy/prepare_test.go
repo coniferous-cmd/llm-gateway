@@ -140,7 +140,7 @@ func TestPrepareForwarding(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer upstream.Close()
-	p := New()
+	p := New(nil)
 	m := keymap.New(map[string][]config.Entry{"virtual": {{
 		Target: config.Target{BaseURL: upstream.URL, APIKey: "real"},
 		Models: []config.Model{{ID: "alias", Name: "real-model"}},
