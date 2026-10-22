@@ -25,35 +25,36 @@ var (
 // Prepare selects the forwarding target for an authenticated request: the
 // entry declaring the body's top-level "model" string when the token declares
 // models, round-robin otherwise. On a match with id != name the body's model
-// literal is rewritten to name in place. The returned string is the caller's
-// model id, empty when no model matched.
-func Prepare(r *http.Request, route *keymap.Route) (config.Target, string, error) {
+// literal is rewritten to name in place. The returned Model carries both the
+// caller's model id and the resolved entry, its zero value when no model
+// matched.
+func Prepare(r *http.Request, route *keymap.Route) (config.Target, config.Model, error) {
 	if !route.HasModels() {
-		return route.RoundRobin(), "", nil
+		return route.RoundRobin(), config.Model{}, nil
 	}
 	body, err := inspectBody(r)
 	if err != nil {
-		return config.Target{}, "", err
+		return config.Target{}, config.Model{}, err
 	}
 	if body == nil {
-		return route.RoundRobin(), "", nil
+		return route.RoundRobin(), config.Model{}, nil
 	}
 	id, start, end, ok := modelValue(body)
 	if !ok {
-		return route.RoundRobin(), "", nil
+		return route.RoundRobin(), config.Model{}, nil
 	}
 	target, model, ok := route.Resolve(id)
 	if !ok {
-		return config.Target{}, "", fmt.Errorf("%w: %q", ErrUnknownModel, id)
+		return config.Target{}, config.Model{}, fmt.Errorf("%w: %q", ErrUnknownModel, id)
 	}
 	if model.ID == model.Name {
-		return target, id, nil
+		return target, model, nil
 	}
 	rewritten := spliceModelValue(body, start, end, model.Name)
 	r.Body = io.NopCloser(bytes.NewReader(rewritten))
 	r.ContentLength = int64(len(rewritten))
 	r.Header.Del("Content-Length")
-	return target, id, nil
+	return target, model, nil
 }
 
 // inspectBody buffers the request body so the model field can be read and

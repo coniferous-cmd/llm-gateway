@@ -50,8 +50,8 @@ func TestPrepareModelRouting(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if target.BaseURL != tt.target || model != tt.model {
-				t.Fatalf("routed to %q with model %q, want %q %q", target.BaseURL, model, tt.target, tt.model)
+			if target.BaseURL != tt.target || model.ID != tt.model {
+				t.Fatalf("routed to %q with model id %q, want %q %q", target.BaseURL, model.ID, tt.target, tt.model)
 			}
 			body, _ := io.ReadAll(req.Body)
 			if string(body) != tt.wantBody {
@@ -74,8 +74,8 @@ func TestPrepareUnresolvableBodiesFallBackToRoundRobin(t *testing.T) {
 		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
 		target, model, err := Prepare(req, route)
 		want := []string{"first", "second"}[i%2]
-		if err != nil || model != "" || target.BaseURL != want {
-			t.Fatalf("%q routed to %q with model %q, %v; want %q", body, target.BaseURL, model, err, want)
+		if err != nil || model.ID != "" || target.BaseURL != want {
+			t.Fatalf("%q routed to %q with model id %q, %v; want %q", body, target.BaseURL, model.ID, err, want)
 		}
 		got, _ := io.ReadAll(req.Body)
 		if string(got) != body {
@@ -98,7 +98,7 @@ func TestPrepareLegacyTokenNeverTouchesBody(t *testing.T) {
 	body := `{"model":"alias"}`
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
 	target, model, err := Prepare(req, routeFor(t, config.Entry{Target: config.Target{BaseURL: "legacy"}}))
-	if err != nil || target.BaseURL != "legacy" || model != "" {
+	if err != nil || target.BaseURL != "legacy" || model.ID != "" {
 		t.Fatal(target, model, err)
 	}
 	got, _ := io.ReadAll(req.Body)
@@ -132,8 +132,8 @@ func TestPrepareUnreadableBodyFallsBackToRoundRobin(t *testing.T) {
 	req.Body = &flakyBody{prefix: []byte(`{"model":"ali`)}
 	req.ContentLength = int64(len(`{"model":"ali`) + 10)
 	target, model, err := Prepare(req, routeFor(t, entries...))
-	if err != nil || model != "" || target.BaseURL != "first" {
-		t.Fatalf("routed to %q with model %q, %v; want first, \"\", nil", target.BaseURL, model, err)
+	if err != nil || model.ID != "" || target.BaseURL != "first" {
+		t.Fatalf("routed to %q with model id %q, %v; want first, \"\", nil", target.BaseURL, model.ID, err)
 	}
 	data, _ := io.ReadAll(req.Body)
 	if string(data) != `{"model":"ali` {

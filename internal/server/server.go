@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"time"
 
+	"llm-gateway/internal/config"
 	"llm-gateway/internal/keymap"
 	"llm-gateway/internal/proxy"
 )
@@ -29,7 +30,7 @@ func NewWithPeers(address string, keys *keymap.Map, logger *slog.Logger, peers m
 		started := time.Now()
 		response := &responseWriter{ResponseWriter: w}
 		route, ok := keys.Select(r.Header.Get("Authorization"))
-		targetURL, model := "", ""
+		targetURL, model := "", config.Model{}
 		defer func() {
 			status := response.status
 			if status == 0 {
@@ -37,8 +38,8 @@ func NewWithPeers(address string, keys *keymap.Map, logger *slog.Logger, peers m
 			}
 			fields := []any{"method", r.Method, "path", r.URL.Path,
 				"target", targetURL, "status", status, "duration", time.Since(started)}
-			if model != "" {
-				fields = append(fields, "model", model)
+			if model.ID != "" {
+				fields = append(fields, slog.Group("model", "id", model.ID, "name", model.Name))
 			}
 			logger.Info("request", fields...)
 		}()

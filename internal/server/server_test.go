@@ -153,7 +153,9 @@ func TestModelBasedRouting(t *testing.T) {
 			t.Fatalf("model-less request: %d, calls %d/%d", w.Code, flashRec.calls, proRec.calls)
 		}
 	}
-	// The log carries the model id only for matched requests.
+	// The log carries the model id and name only for matched requests:
+	// line 0 is flash (id == name), line 1 is the alias-pro rewrite.
+	wantModels := [][2]string{{"mimo-v2.6-flash", "mimo-v2.6-flash"}, {"alias-pro", "mimo-v2.6-pro"}}
 	for i, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
 		var fields map[string]any
 		if err := json.Unmarshal([]byte(line), &fields); err != nil {
@@ -162,6 +164,14 @@ func TestModelBasedRouting(t *testing.T) {
 		_, logged := fields["model"]
 		if want := i < 2; logged != want {
 			t.Fatalf("line %d model logging = %v: %s", i, logged, line)
+		}
+		if logged {
+			model, _ := fields["model"].(map[string]any)
+			id, _ := model["id"].(string)
+			name, _ := model["name"].(string)
+			if id != wantModels[i][0] || name != wantModels[i][1] {
+				t.Fatalf("line %d model = {id:%q name:%q}, want %q/%q", i, id, name, wantModels[i][0], wantModels[i][1])
+			}
 		}
 	}
 }
