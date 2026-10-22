@@ -1,6 +1,7 @@
 package keymap
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -80,6 +81,17 @@ func TestLegacyTokenHasNoModels(t *testing.T) {
 	route, _ := m.Select("Bearer dev")
 	if route.HasModels() {
 		t.Fatal("legacy token inspected for models")
+	}
+}
+
+func TestTargetContext(t *testing.T) {
+	if _, ok := TargetFromContext(context.Background()); ok {
+		t.Fatal("empty context reports a target")
+	}
+	want := config.Target{BaseURL: "https://api.example", APIKey: "real"}
+	got, ok := TargetFromContext(WithTarget(context.Background(), want))
+	if !ok || got != want {
+		t.Fatalf("TargetFromContext = %v, %v; want %v, true", got, ok, want)
 	}
 }
 
