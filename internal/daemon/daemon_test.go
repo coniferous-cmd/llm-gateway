@@ -79,6 +79,70 @@ func TestStopStalePIDFile(t *testing.T) {
 	}
 }
 
+// Stop must terminate a live recorded process and remove its pid file.
+func TestStopTerminatesLiveProcess(t *testing.T) {
+	dir := t.TempDir()
+	ready := filepath.Join(dir, "ready")
+	cmd := exec.Command(os.Args[0], "-test.run=TestHelperSleepUntilKilled")
+	cmd.Env = append(os.Environ(), "LLM_GATEWAY_TEST_HELPER=sleep", "LLM_GATEWAY_TEST_READY="+ready)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}()
+	awaitFile(t, ready)
+	path := filepath.Join(dir, "gateway.pid")
+	if err := WritePID(path, cmd.Process.Pid); err != nil {
+		t.Fatal(err)
+	}
+	pid, err := Stop(path, 10*time.Second)
+	if err != nil || pid != cmd.Process.Pid {
+		t.Fatalf("Stop = %d, %v; want %d, nil", pid, err, cmd.Process.Pid)
+	}
+	if Alive(cmd.Process.Pid) {
+		t.Fatal("process still alive after Stop")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("pid file still present: %v", err)
+	}
+}
+
+// TestHelperSleepUntilKilled only does anything as a spawned child process.
+func TestHelperSleepUntilKilled(t *testing.T) {
+	if os.Getenv("LLM_GATEWAY_TEST_HELPER") != "sleep" {
+		return
+	}
+	helperSignalReady(t)
+	time.Sleep(time.Minute)
+}
+
+func helperSignalReady(t *testing.T) {
+	t.Helper()
+	path := os.Getenv("LLM_GATEWAY_TEST_READY")
+	if path == "" {
+		t.Fatal("LLM_GATEWAY_TEST_READY not set")
+	}
+	if err := os.WriteFile(path, []byte("ready"), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func awaitFile(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("helper never signaled readiness via %s", path)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // deadPID runs this test binary to completion and returns its now-unused pid.
 func deadPID(t *testing.T) int {
 	t.Helper()
