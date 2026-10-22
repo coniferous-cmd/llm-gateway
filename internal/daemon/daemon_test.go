@@ -88,9 +88,17 @@ func TestStopTerminatesLiveProcess(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
+	// Reap the child the moment it exits: an unreaped child is a POSIX zombie,
+	// and kill(pid, 0) succeeds on zombies, so Alive would never observe the
+	// death Stop causes. This parent outlives the child, so nothing else reaps.
+	exited := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(exited)
+	}()
 	defer func() {
 		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
+		<-exited
 	}()
 	awaitFile(t, ready)
 	path := filepath.Join(dir, "gateway.pid")
