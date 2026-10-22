@@ -17,19 +17,20 @@ export CGO_ENABLED := 0
 
 .PHONY: help build run daemon stop test test-race vet fmt check build-all
 
+# Quotes keep ; ( ) in the help text from being parsed by the recipe shell.
 help:
-	@echo make build       - Build the native executable in $(BIN_DIR)
-	@echo make run         - Build and run; CONFIG=./config.yaml optional
-	@echo make daemon      - Build and run detached in the background; CONFIG optional
-	@echo make stop        - Stop the background gateway
-	@echo make test        - Run unit tests
-	@echo make test-race   - Run race tests; requires a native C compiler
-	@echo make vet         - Run go vet
-	@echo make fmt         - Format Go source
-	@echo make check       - Run tests and vet
-	@echo make build-all   - Build Windows, Linux and macOS for amd64 and arm64, plus Linux arm
-	@echo Override config: make run CONFIG=./config.example.yaml
-	@echo Override version: make build VERSION=v1.2.3 (default: git describe)
+	@echo "make build       - Build the native executable in $(BIN_DIR)"
+	@echo "make run         - Build and run; CONFIG=./config.yaml optional"
+	@echo "make daemon      - Build and run detached in the background; CONFIG optional"
+	@echo "make stop        - Stop the background gateway"
+	@echo "make test        - Run unit tests"
+	@echo "make test-race   - Run race tests; requires a native C compiler"
+	@echo "make vet         - Run go vet"
+	@echo "make fmt         - Format Go source"
+	@echo "make check       - Run tests and vet"
+	@echo "make build-all   - Build Windows, Linux and macOS for amd64 and arm64, plus Linux arm"
+	@echo "Override config: make run CONFIG=./config.example.yaml"
+	@echo "Override version: make build VERSION=v1.2.3 (default: git describe)"
 
 build:
 	$(GO) build -trimpath -ldflags="$(LDFLAGS)" -o "$(BINARY)" ./cmd/llm-gateway
