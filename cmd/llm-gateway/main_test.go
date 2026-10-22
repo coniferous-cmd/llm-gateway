@@ -14,6 +14,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"llm-gateway/internal/daemon"
 )
 
 // Model routing through the real binary: one token, two entries with disjoint
@@ -251,4 +253,154 @@ func TestCLIEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Log("curl verified: first SSE event arrived before upstream was allowed to finish")
+}
+
+// writeMinimalConfig writes a valid config whose only upstream is unreachable;
+// tests that never send requests do not care.
+func writeMinimalConfig(t *testing.T, dir string) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := listener.Addr().String()
+	listener.Close()
+	path := filepath.Join(dir, "config.yaml")
+	data := fmt.Sprintf("listen: %q\nkeys:\n  - token: virtual\n    target: {base_url: \"http://127.0.0.1:1\"}\n", address)
+	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestCLIVersion(t *testing.T) {
+	dir := t.TempDir()
+	binary := buildBinary(t, dir)
+	output, err := exec.Command(binary, "--version").CombinedOutput()
+	if err != nil {
+		t.Fatalf("--version: %v\n%s", err, output)
+	}
+	if !strings.HasPrefix(string(output), "llm-gateway ") {
+		t.Fatalf("--version output = %q", output)
+	}
+}
+
+func TestCLIBadLogFile(t *testing.T) {
+	dir := t.TempDir()
+	binary := buildBinary(t, dir)
+	configPath := writeMinimalConfig(t, dir)
+	badLog := filepath.Join(dir, "missing", "gateway.log")
+	output, err := exec.Command(binary, "--config", configPath, "--log-file", badLog).CombinedOutput()
+	if err == nil {
+		t.Fatalf("started despite unwritable log file:\n%s", output)
+	}
+	if !strings.Contains(string(output), "open log file") {
+		t.Fatalf("log-file failure not reported:\n%s", output)
+	}
+}
+
+// A live process recorded in the pid file must make the foreground start
+// refuse, and the foreign pid file must survive the refusal untouched.
+func TestCLIForegroundRefusesLivePIDFile(t *testing.T) {
+	dir := t.TempDir()
+	binary := buildBinary(t, dir)
+	configPath := writeMinimalConfig(t, dir)
+	pidFile := filepath.Join(dir, "gateway.pid")
+	if err := os.WriteFile(pidFile, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0600); err != nil {
+		t.Fatal(err)
+	}
+	output, err := exec.Command(binary, "--config", configPath, "--pid-file", pidFile).CombinedOutput()
+	if err == nil {
+		t.Fatalf("started despite live pid file:\n%s", output)
+	}
+	if !strings.Contains(string(output), "already running") {
+		t.Fatalf("pid conflict not reported:\n%s", output)
+	}
+	data, err := os.ReadFile(pidFile)
+	if err != nil || strings.TrimSpace(string(data)) != fmt.Sprint(os.Getpid()) {
+		t.Fatalf("foreign pid file altered: %q %v", data, err)
+	}
+}
+
+func TestProbeAddress(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{":8080", "127.0.0.1:8080"},
+		{"0.0.0.0:8080", "127.0.0.1:8080"},
+		{"[::]:8080", "127.0.0.1:8080"},
+		{"127.0.0.1:9000", "127.0.0.1:9000"},
+		{"localhost:9000", "localhost:9000"},
+		{"garbage", "garbage"},
+	}
+	for _, tt := range tests {
+		if got := probeAddress(tt.in); got != tt.want {
+			t.Fatalf("probeAddress(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+// TestHelperSleep only does anything as a spawned child process.
+func TestHelperSleep(t *testing.T) {
+	if os.Getenv("LLM_GATEWAY_TEST_HELPER") != "sleep" {
+		return
+	}
+	time.Sleep(time.Minute)
+}
+
+// A child that exits before writing the pid file must be reported, not timed out.
+func TestWaitReadyReportsExitedChild(t *testing.T) {
+	cmd := exec.Command(os.Args[0], "-test.run=TestNoMatchSoWeExitImmediately")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	err := waitReady(cmd, "127.0.0.1:1", filepath.Join(t.TempDir(), "never.pid"), 5*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "process exited during startup") {
+		t.Fatalf("waitReady = %v, want exited-during-startup error", err)
+	}
+}
+
+// A child that never records the watched pid file must be killed at the deadline.
+func TestWaitReadyTimesOutAndKills(t *testing.T) {
+	cmd := exec.Command(os.Args[0], "-test.run=TestHelperSleep")
+	cmd.Env = append(os.Environ(), "LLM_GATEWAY_TEST_HELPER=sleep")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pid := cmd.Process.Pid
+	// waitReady reaps the child through its own cmd.Wait goroutine, so the test
+	// only watches the pid; reading ProcessState here would race that Wait.
+	err := waitReady(cmd, "127.0.0.1:1", filepath.Join(t.TempDir(), "never.pid"), 500*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "did not start listening") {
+		t.Fatalf("waitReady = %v, want timeout error", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for daemon.Alive(pid) {
+		if time.Now().After(deadline) {
+			t.Fatal("child was not killed by the waitReady timeout")
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+// The happy path: a child whose pid file matches and whose address accepts
+// connections makes waitReady return success.
+func TestWaitReadySucceedsWhenChildListens(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	cmd := exec.Command(os.Args[0], "-test.run=TestHelperSleep")
+	cmd.Env = append(os.Environ(), "LLM_GATEWAY_TEST_HELPER=sleep")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	// waitReady owns cmd.Wait through its goroutine; only Kill from here.
+	defer func() { _ = cmd.Process.Kill() }()
+	pidFile := filepath.Join(t.TempDir(), "gateway.pid")
+	if err := os.WriteFile(pidFile, []byte(fmt.Sprintf("%d\n", cmd.Process.Pid)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitReady(cmd, listener.Addr().String(), pidFile, 5*time.Second); err != nil {
+		t.Fatalf("waitReady = %v", err)
+	}
 }
