@@ -121,6 +121,40 @@ func TestPrepareCompressedBodyPassesThrough(t *testing.T) {
 	}
 }
 
+// A body that dies mid-read must be replayed untouched (partial bytes plus
+// the original closer) and routed round-robin rather than rejected.
+func TestPrepareUnreadableBodyFallsBackToRoundRobin(t *testing.T) {
+	entries := []config.Entry{
+		{Target: config.Target{BaseURL: "first"}, Models: []config.Model{{ID: "m", Name: "m"}}},
+		{Target: config.Target{BaseURL: "second"}, Models: []config.Model{{ID: "m", Name: "m"}}},
+	}
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	req.Body = &flakyBody{prefix: []byte(`{"model":"ali`)}
+	req.ContentLength = int64(len(`{"model":"ali`) + 10)
+	target, model, err := Prepare(req, routeFor(t, entries...))
+	if err != nil || model != "" || target.BaseURL != "first" {
+		t.Fatalf("routed to %q with model %q, %v; want first, \"\", nil", target.BaseURL, model, err)
+	}
+	data, _ := io.ReadAll(req.Body)
+	if string(data) != `{"model":"ali` {
+		t.Fatalf("replayed body = %q, want the partial prefix", data)
+	}
+}
+
+// flakyBody serves a fixed prefix once and then fails every read.
+type flakyBody struct{ prefix []byte }
+
+func (f *flakyBody) Read(p []byte) (int, error) {
+	if len(f.prefix) == 0 {
+		return 0, errors.New("connection reset mid-body")
+	}
+	n := copy(p, f.prefix)
+	f.prefix = f.prefix[n:]
+	return n, nil
+}
+
+func (f *flakyBody) Close() error { return nil }
+
 func TestPrepareBodyTooLarge(t *testing.T) {
 	body := strings.Repeat("x", maxInspectedBody+1)
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))

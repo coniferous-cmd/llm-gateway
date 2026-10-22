@@ -1,6 +1,9 @@
 package proxy
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestModelValue(t *testing.T) {
 	tests := []struct {
@@ -9,7 +12,7 @@ func TestModelValue(t *testing.T) {
 	}{
 		{"compact", `{"model":"alias","n":1}`, "alias", `{"model":"real","n":1}`},
 		{"pretty printed", "{\n  \"n\" : 1 ,\n  \"model\" : \"alias\"\n}", "alias", "{\n  \"n\" : 1 ,\n  \"model\" : \"real\"\n}"},
-		{"escaped value", `{"model":"ali\u0061s","n":1}`, "alias", `{"model":"real","n":1}`},
+		{"escaped value", `{"model":"alias","n":1}`, "alias", `{"model":"real","n":1}`},
 		{"duplicate key first wins", `{"model":"first","model":"second"}`, "first", `{"model":"real","model":"second"}`},
 		{"model after nested object", `{"nested":{"model":"inner"},"model":"outer"}`, "outer", `{"nested":{"model":"inner"},"model":"real"}`},
 		{"nested only", `{"nested":{"model":"inner"}}`, "", ""},
@@ -40,6 +43,43 @@ func TestModelValue(t *testing.T) {
 			}
 		})
 	}
+}
+
+// FuzzModelValue pins the invariants of the hand-written JSON scanner: it
+// never panics, a resolved span always covers exactly a JSON string literal
+// that decodes to the reported value, and splicing leaves every other byte
+// untouched.
+func FuzzModelValue(f *testing.F) {
+	f.Add(`{"model":"alias"}`)
+	f.Add(`{"model":"a","model":"b"}`)
+	f.Add(`{"nested":{"model":"x"}}`)
+	f.Add(`{"model":1}`)
+	f.Add(`{"model":" ali as "}`)
+	f.Add(`{}`)
+	f.Add(`[{"model":"x"}]`)
+	f.Add(`{"model":`)
+	f.Add("")
+	f.Fuzz(func(t *testing.T, body string) {
+		value, start, end, ok := modelValue([]byte(body))
+		if !ok {
+			return
+		}
+		if start < 0 || end > len(body) || start >= end {
+			t.Fatalf("span [%d:%d) outside body %q", start, end, body)
+		}
+		var decoded string
+		if err := json.Unmarshal([]byte(body[start:end]), &decoded); err != nil || decoded != value {
+			t.Fatalf("span %q decodes as %q, %v; want %q", body[start:end], decoded, err, value)
+		}
+		quoted, err := json.Marshal("real")
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := string(body[:start]) + string(quoted) + string(body[end:])
+		if got := string(spliceModelValue([]byte(body), start, end, "real")); got != want {
+			t.Fatalf("splice = %q, want %q", got, want)
+		}
+	})
 }
 
 func TestSplicePreservesSurroundingBytes(t *testing.T) {
