@@ -252,6 +252,132 @@ func TestRunListenFailure(t *testing.T) {
 	}
 }
 
+// Shutdown must drain an in-flight SSE stream instead of severing it: cancel
+// while the first event is on the wire, then the client must still receive
+// everything the upstream sends afterwards and Run must report success.
+func TestRunDrainsActiveStream(t *testing.T) {
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: first\n\n")
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		_, _ = io.WriteString(w, "data: last\n\n")
+	}))
+	defer upstream.Close()
+	defer close(release)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := listener.Addr().String()
+	listener.Close()
+	keys := keymap.New(map[string][]config.Entry{"virtual": {{Target: config.Target{BaseURL: upstream.URL}}}})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	srv := New(address, keys, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, srv) }()
+	client := &http.Client{Timeout: 10 * time.Second}
+	defer client.CloseIdleConnections()
+	deadline := time.Now().Add(5 * time.Second)
+	var resp *http.Response
+	for {
+		req, _ := http.NewRequest("GET", "http://"+address+"/stream", nil)
+		req.Header.Set("Authorization", "Bearer virtual")
+		resp, err = client.Do(req)
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("gateway never started: %v", err)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	defer resp.Body.Close()
+	line, err := bufio.NewReader(resp.Body).ReadString('\n')
+	if err != nil || line != "data: first\n" {
+		t.Fatalf("first event: %q %v", line, err)
+	}
+	// Shutdown begins while the stream is active; the listener must close.
+	cancel()
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		conn, err := net.DialTimeout("tcp", address, 250*time.Millisecond)
+		if err != nil {
+			break
+		}
+		conn.Close()
+		if time.Now().After(deadline) {
+			t.Fatal("listener still open after cancel")
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	release <- struct{}{}
+	rest, err := io.ReadAll(resp.Body)
+	if err != nil || string(rest) != "data: last\n\n" {
+		t.Fatalf("drained tail: %q %v", rest, err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run after drain: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("shutdown did not finish after the stream drained")
+	}
+}
+
+// A first Write or Flush without WriteHeader must record the implicit 200.
+func TestResponseWriterImplicitOK(t *testing.T) {
+	rec := httptest.NewRecorder()
+	w := &responseWriter{ResponseWriter: rec}
+	if _, err := w.Write([]byte("body")); err != nil {
+		t.Fatal(err)
+	}
+	if w.status != http.StatusOK || rec.Code != http.StatusOK || rec.Body.String() != "body" {
+		t.Fatalf("status %d, recorder %d, body %q", w.status, rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	w = &responseWriter{ResponseWriter: rec}
+	w.Flush()
+	if w.status != http.StatusOK || !rec.Flushed {
+		t.Fatalf("status %d, flushed %v", w.status, rec.Flushed)
+	}
+}
+
+func TestResponseWriterUnwrap(t *testing.T) {
+	rec := httptest.NewRecorder()
+	w := &responseWriter{ResponseWriter: rec}
+	if w.Unwrap() != rec {
+		t.Fatal("Unwrap does not expose the underlying writer")
+	}
+}
+
+func TestResponseWriterHijack(t *testing.T) {
+	fake := &hijackRecorder{ResponseWriter: httptest.NewRecorder()}
+	w := &responseWriter{ResponseWriter: fake}
+	conn, _, err := w.Hijack()
+	if err != nil || conn != nil || !fake.hijacked {
+		t.Fatalf("Hijack = %v %v, hijacked %v", conn, err, fake.hijacked)
+	}
+}
+
+// hijackRecorder is the minimal http.Hijacker the ResponseController needs.
+type hijackRecorder struct {
+	http.ResponseWriter
+	hijacked bool
+}
+
+func (h *hijackRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h.hijacked = true
+	return nil, nil, nil
+}
+
 func TestResponseWriterInformationalStatus(t *testing.T) {
 	w := &responseWriter{ResponseWriter: httptest.NewRecorder()}
 	w.WriteHeader(103)
