@@ -37,6 +37,14 @@ func DefaultPath() (string, error) {
 	return filepath.Join(dir, "config.yaml"), nil
 }
 
+// RewriteRule replaces a literal escaped path prefix with Destination.
+// An empty Destination represents the YAML '-' prefix-deletion marker.
+// Rules are validated at startup and evaluated in configuration order.
+type RewriteRule struct {
+	Source      string
+	Destination string
+}
+
 type Target struct {
 	BaseURL string `yaml:"base_url"`
 	APIKey  string `yaml:"api_key"`
@@ -44,6 +52,8 @@ type Target struct {
 	// encrypted Noise session instead of plain HTTP. Mutually exclusive with
 	// BaseURL.
 	Peer string `yaml:"peer"`
+	// Rewrite belongs to this target and is immutable after startup.
+	Rewrite []RewriteRule `yaml:"-"`
 }
 
 // E2EE configures the gateway-to-gateway encrypted channel. Every gateway
@@ -112,8 +122,11 @@ func Parse(data []byte) (*Config, error) {
 			} `yaml:"peers"`
 		} `yaml:"e2ee"`
 		Keys []struct {
-			Token  string  `yaml:"token"`
-			Target Target  `yaml:"target"`
+			Token  string `yaml:"token"`
+			Target struct {
+				Target  `yaml:",inline"`
+				Rewrite yaml.Node `yaml:"rewrite"`
+			} `yaml:"target"`
 			Models []Model `yaml:"models"`
 		} `yaml:"keys"`
 	}
@@ -198,11 +211,16 @@ func Parse(data []byte) (*Config, error) {
 		default:
 			return nil, fmt.Errorf("line %d: keys[%d].target must set one of base_url or peer", targetNode.Line, i)
 		}
+		rules, err := parseRewrite(&entry.Target.Rewrite, i)
+		if err != nil {
+			return nil, err
+		}
+		entry.Target.Target.Rewrite = rules
 		models, err := validateModels(field(node, "models"), entry.Token, cfg.Keys[entry.Token], entry.Models, i)
 		if err != nil {
 			return nil, err
 		}
-		cfg.Keys[entry.Token] = append(cfg.Keys[entry.Token], Entry{Target: entry.Target, Models: models})
+		cfg.Keys[entry.Token] = append(cfg.Keys[entry.Token], Entry{Target: entry.Target.Target, Models: models})
 	}
 	// A peer's e2ee address must never collide with a plaintext target: the
 	// transport decides encryption by destination address alone, so an

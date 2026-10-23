@@ -17,6 +17,16 @@ keys:
     target:
       base_url: https://api.openai.com
       api_key: sk-real-replace-me
+      # Optional ordered path-prefix rules, inside target (not beside token).
+      # First full-segment prefix match wins; no chaining. Put specific rules
+      # before broad ones. Query and unmatched/omitted paths stay unchanged.
+      # /api/chat/completions?stream=true -> /v1/chat/completions?stream=true
+      rewrite:
+        - '/api:/v1'
+        - '/openai:/v1'
+        # '-' deletes the prefix: /anthropic/v1/messages -> /v1/messages;
+        # /anthropic and /anthropic/ become /. An empty destination is invalid.
+        - '/anthropic:-'
     # Optional: the models this entry serves. "id" is the model name callers
     # send in their requests, "name" is the model name the provider receives.
     models:
@@ -24,7 +34,15 @@ keys:
         name: mimo-v2.6-flash
       - id: mimo-v2.6-pro
         name: mimo-v2.6-pro
-  # Repeat a token to round-robin across compatible upstreams.
+  # Repeat a token to round-robin across compatible upstreams. Each target
+  # has its own rules; e.g. another sk-virt-dev target could use:
+  #- token: sk-virt-dev
+  #  target:
+  #    base_url: https://other.example.com
+  #    api_key: sk-other-replace-me
+  #    rewrite:
+  #      - '/api:/v2'
+  #      - '/openai:/v2'
   # api_key is optional for upstreams that do not require authentication.
   - token: sk-virt-local
     target:
@@ -36,3 +54,5 @@ keys:
   #  target:
   #    peer: gateway-c
   #    api_key: sk-virt-on-gateway-c
+  #    rewrite:
+  #      - '/api:/v1' # applies once here, before the encrypted hop

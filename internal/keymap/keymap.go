@@ -30,7 +30,11 @@ func New(keys map[string][]config.Entry) *Map {
 			continue
 		}
 		r := &Route{entries: append([]config.Entry(nil), entries...), byModel: make(map[string]modelTarget)}
-		for _, entry := range r.entries {
+		for i := range r.entries {
+			// Own the rule slice so later changes to the startup input cannot
+			// change either model selection or round-robin forwarding.
+			r.entries[i].Target.Rewrite = append([]config.RewriteRule(nil), r.entries[i].Target.Rewrite...)
+			entry := r.entries[i]
 			for _, model := range entry.Models {
 				r.byModel[model.ID] = modelTarget{target: entry.Target, model: model}
 			}

@@ -125,6 +125,9 @@ func TestUnavailable(t *testing.T) {
 func TestSSEFlush(t *testing.T) {
 	release := make(chan struct{})
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.RequestURI != "/v1/stream" {
+			t.Errorf("SSE path = %q", r.RequestURI)
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, "data: first\n\n")
 		w.(http.Flusher).Flush()
@@ -136,10 +139,10 @@ func TestSSEFlush(t *testing.T) {
 		_, _ = io.WriteString(w, "data: second\n\n")
 	}))
 	defer upstream.Close()
-	s := gateway(t, config.Target{BaseURL: upstream.URL})
+	s := gateway(t, config.Target{BaseURL: upstream.URL, Rewrite: []config.RewriteRule{{Source: "/api", Destination: "/v1"}}})
 	defer close(release)
 	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(s.URL + "/stream")
+	resp, err := client.Get(s.URL + "/api/stream")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,6 +214,9 @@ func TestPeerForwardingOverE2EE(t *testing.T) {
 func TestSSEStreamingOverE2EE(t *testing.T) {
 	release := make(chan struct{})
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.RequestURI != "/v1/stream" {
+			t.Errorf("encrypted SSE path = %q", r.RequestURI)
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, "data: first\n\n")
 		w.(http.Flusher).Flush()
@@ -229,9 +235,9 @@ func TestSSEStreamingOverE2EE(t *testing.T) {
 	peerAddr, stop := startE2EEServer(t, peerID, map[string][]byte{"client": clientID.Public.Public}, upstream)
 	defer stop()
 	dialer := e2eeDialer(clientID, peerAddr, peerID.Public.Public)
-	s := gatewayWithPeers(t, config.Target{BaseURL: "http://" + peerAddr, APIKey: "sk-virt", Peer: "peer"},
+	s := gatewayWithPeers(t, config.Target{BaseURL: "http://" + peerAddr, APIKey: "sk-virt", Peer: "peer", Rewrite: []config.RewriteRule{{Source: "/api", Destination: "/v1"}}},
 		map[string]PeerDialer{peerAddr: dialer})
-	resp, err := http.Get(s.URL + "/stream")
+	resp, err := http.Get(s.URL + "/api/stream")
 	if err != nil {
 		t.Fatal(err)
 	}

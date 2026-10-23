@@ -3,6 +3,7 @@ package keymap
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -88,9 +89,9 @@ func TestTargetContext(t *testing.T) {
 	if _, ok := TargetFromContext(context.Background()); ok {
 		t.Fatal("empty context reports a target")
 	}
-	want := config.Target{BaseURL: "https://api.example", APIKey: "real"}
+	want := config.Target{BaseURL: "https://api.example", APIKey: "real", Rewrite: []config.RewriteRule{{Source: "/api", Destination: "/v1"}}}
 	got, ok := TargetFromContext(WithTarget(context.Background(), want))
-	if !ok || got != want {
+	if !ok || !reflect.DeepEqual(got, want) {
 		t.Fatalf("TargetFromContext = %v, %v; want %v, true", got, ok, want)
 	}
 }

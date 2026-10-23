@@ -41,11 +41,13 @@ func New(peers map[string]PeerDialer) http.Handler {
 		FlushInterval: -1,
 		Director: func(r *http.Request) {
 			target, _ := keymap.TargetFromContext(r.Context())
+			rewritePath(r.URL, target.Rewrite)
 			base, _ := url.Parse(target.BaseURL) // Validated once at startup.
 			r.URL.Scheme, r.URL.Host = base.Scheme, base.Host
 			// Host must identify the upstream virtual host, including any port.
 			r.Host = base.Host
-			// Path, RawPath, RawQuery, body and other application headers stay intact.
+			// Query, body and other application headers stay intact; path
+			// changes only when this target has a matching rewrite rule.
 			if target.APIKey == "" {
 				r.Header.Del("Authorization")
 			} else {
