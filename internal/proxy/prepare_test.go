@@ -94,16 +94,34 @@ func TestPrepareUnresolvableBodiesFallBackToRoundRobin(t *testing.T) {
 	}
 }
 
-func TestPrepareLegacyTokenNeverTouchesBody(t *testing.T) {
+func TestPrepareLegacyTokenLogsModelWithoutRewriting(t *testing.T) {
 	body := `{"model":"alias"}`
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
 	target, model, err := Prepare(req, routeFor(t, config.Entry{Target: config.Target{BaseURL: "legacy"}}))
-	if err != nil || target.BaseURL != "legacy" || model.ID != "" {
+	if err != nil || target.BaseURL != "legacy" || model.ID != "alias" || model.Name != "alias" {
 		t.Fatal(target, model, err)
 	}
 	got, _ := io.ReadAll(req.Body)
 	if string(got) != body {
 		t.Fatalf("body changed: %q", got)
+	}
+}
+
+func TestPrepareLegacyLargeBodyPassesThrough(t *testing.T) {
+	body := `{"model":"alias","data":"` + strings.Repeat("x", maxInspectedBody) + `"}`
+	for _, unknownLength := range []bool{false, true} {
+		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+		if unknownLength {
+			req.ContentLength = -1
+		}
+		target, model, err := Prepare(req, routeFor(t, config.Entry{Target: config.Target{BaseURL: "legacy"}}))
+		if err != nil || target.BaseURL != "legacy" || model.ID != "" {
+			t.Fatal(target, model, err)
+		}
+		got, err := io.ReadAll(req.Body)
+		if err != nil || string(got) != body {
+			t.Fatalf("large body changed (unknown length %v): %v", unknownLength, err)
+		}
 	}
 }
 

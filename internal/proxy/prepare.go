@@ -26,13 +26,11 @@ var (
 // entry declaring the body's top-level "model" string when the token declares
 // models, round-robin otherwise. On a match with id != name the body's model
 // literal is rewritten to name in place. The returned Model carries both the
-// caller's model id and the resolved entry, its zero value when no model
-// matched.
+// caller's model id and upstream name (equal for passthrough tokens), or its
+// zero value when no model could be inspected.
 func Prepare(r *http.Request, route *keymap.Route) (config.Target, config.Model, error) {
-	if !route.HasModels() {
-		return route.RoundRobin(), config.Model{}, nil
-	}
-	body, err := inspectBody(r)
+	hasModels := route.HasModels()
+	body, err := inspectBody(r, hasModels)
 	if err != nil {
 		return config.Target{}, config.Model{}, err
 	}
@@ -42,6 +40,9 @@ func Prepare(r *http.Request, route *keymap.Route) (config.Target, config.Model,
 	id, start, end, ok := modelValue(body)
 	if !ok {
 		return route.RoundRobin(), config.Model{}, nil
+	}
+	if !hasModels {
+		return route.RoundRobin(), config.Model{ID: id, Name: id}, nil
 	}
 	target, model, ok := route.Resolve(id)
 	if !ok {
@@ -61,13 +62,18 @@ func Prepare(r *http.Request, route *keymap.Route) (config.Target, config.Model,
 // possibly rewritten, and installs the buffered bytes as the new request body.
 // It returns nil when the body must not be inspected (empty or non-identity
 // content encoding) or cannot be (a read error mid-body: the partial body is
-// replayed untouched). A body beyond the limit fails with ErrBodyTooLarge.
-func inspectBody(r *http.Request) ([]byte, error) {
-	if r.Body == nil || r.ContentLength == 0 || encoded(r) {
+// replayed untouched). Beyond the limit, model routing fails with
+// ErrBodyTooLarge; logging-only inspection replays the body without rejecting it.
+func inspectBody(r *http.Request, enforceLimit bool) ([]byte, error) {
+	if r.Body == nil || r.ContentLength == 0 || encoded(r) || (!enforceLimit && r.ContentLength > maxInspectedBody) {
 		return nil, nil
 	}
 	data, err := io.ReadAll(io.LimitReader(r.Body, maxInspectedBody+1))
 	if err != nil {
+		r.Body = replay{Reader: io.MultiReader(bytes.NewReader(data), r.Body), Closer: r.Body}
+		return nil, nil
+	}
+	if len(data) > maxInspectedBody && !enforceLimit {
 		r.Body = replay{Reader: io.MultiReader(bytes.NewReader(data), r.Body), Closer: r.Body}
 		return nil, nil
 	}

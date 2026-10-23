@@ -98,6 +98,37 @@ func TestAuthenticationRoutingAndLogs(t *testing.T) {
 	}
 }
 
+func TestPassthroughModelLogging(t *testing.T) {
+	const body = `{"model":"provider-model","messages":[]}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		data, _ := io.ReadAll(r.Body)
+		if string(data) != body {
+			t.Errorf("body changed: %q", data)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	var logs bytes.Buffer
+	keys := keymap.New(map[string][]config.Entry{"virtual": {{Target: config.Target{BaseURL: upstream.URL}}}})
+	srv := New(config.DefaultListen, keys, slog.New(slog.NewJSONHandler(&logs, nil)))
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer virtual")
+	w := httptest.NewRecorder()
+	srv.Handler.ServeHTTP(w, req)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d", w.Code)
+	}
+	var fields struct {
+		Model config.Model `json:"model"`
+	}
+	if err := json.Unmarshal(logs.Bytes(), &fields); err != nil {
+		t.Fatal(err)
+	}
+	if fields.Model.ID != "provider-model" || fields.Model.Name != "provider-model" {
+		t.Fatalf("missing passthrough model: %s", logs.String())
+	}
+}
+
 func TestModelBasedRouting(t *testing.T) {
 	type record struct {
 		calls int
