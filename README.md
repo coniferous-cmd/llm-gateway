@@ -1,6 +1,6 @@
 # llm-gateway
 
-A lightweight, locally running LLM gateway: callers only store virtual keys; the gateway picks the upstream and swaps `Authorization`. It does not convert protocols, count tokens, retry, fail over, or hot-reload configuration. Request bodies pass through untouched, with one optional exception: [model routing](#model-routing) reads — and possibly rewrites — the top-level `model` field of JSON request bodies.
+A lightweight, locally running LLM gateway: callers only store virtual keys; the gateway picks the upstream, swaps `Authorization`, and optionally [rewrites path prefixes](#path-rewriting) per target. It does not convert protocols, count tokens, retry, fail over, or hot-reload configuration. Request bodies pass through untouched, with one optional exception: [model routing](#model-routing) reads — and possibly rewrites — the top-level `model` field of JSON request bodies.
 
 Supports Windows, Linux, macOS (amd64 / arm64). The release is a single binary with no dependency on Go, Node.js, Python, or a C compiler; the config file is supplied separately. The third-party Go dependencies are `gopkg.in/yaml.v3` (config parsing) and `github.com/flynn/noise` (the Noise protocol, used only for the optional gateway-to-gateway encrypted channel).
 
@@ -54,6 +54,7 @@ keys:
 - `keys` must not be empty; each entry needs a non-empty `token` and a valid `target.base_url`.
 - `base_url` must be an HTTP(S) **bare origin**, e.g. `https://api.openai.com`; it must not contain a path such as `/v1`, a query, a fragment, or username/password. A trailing `/` is normalized away.
 - A non-empty `api_key` becomes `Authorization: Bearer <api_key>`; do not include `Bearer ` in the config value.
+- A target may declare `rewrite`, an ordered list of path prefix rules — see [path rewriting](#path-rewriting). This field belongs inside `target`, not alongside `token`.
 - An entry may declare `models` — the model names it serves — turning on [model routing](#model-routing) for that token.
 - Declaring the same `token` again appends another target in config order; each authenticated request round-robins through them, with counters kept per token. Only put upstreams that are compatible in protocol and model names under the same token.
 - The config is loaded once at startup; changes require a restart. Startup validation failures report the offending field and exit.
@@ -70,6 +71,41 @@ keys:
     target:
       base_url: http://127.0.0.1:11435
 ```
+
+### Path rewriting
+
+Each target may map client path prefixes to the paths its upstream expects:
+
+```yaml
+keys:
+  - token: sk-virt-dev
+    target:
+      base_url: https://api.openai.com
+      api_key: sk-real-replace-me
+      rewrite:
+        - '/api:/v1'
+        - '/openai:/v1'
+  # The same token can select another upstream with its own rules.
+  - token: sk-virt-dev
+    target:
+      base_url: https://other.example.com
+      api_key: sk-other-replace-me
+      rewrite:
+        - '/api:/v2'
+        - '/openai:/v2'
+```
+
+After model routing or round-robin selects an entry, **only that target's rules** apply. With the first target above, `/api/chat/completions?stream=true` forwards to `https://api.openai.com/v1/chat/completions?stream=true`; `/openai/models` forwards to `/v1/models`. Selecting the second target instead uses its `/v2` mappings. Upstreams under one token still need to speak compatible protocols and support the caller's models.
+
+- `rewrite` is an optional **list of strings**, each `source:destination`; omitted or `[]` leaves paths unchanged. Invalid rules fail startup with the key index, field or rule index, and YAML line.
+- Match only a complete path-segment prefix, case-sensitively: `/api` matches `/api` and `/api/models`, but not `/apix/models` or `/other/api/models`.
+- **First matching rule wins**, not the longest match. Put more-specific prefixes before broader ones. Rewriting happens once per gateway hop: `['/api:/v1', '/v1:/v2']` turns `/api/models` into `/v1/models`, not `/v2/models`.
+- Use destination `-` as the **delete-prefix marker**: `'/api:-'` maps `/api/v1/messages` to `/v1/messages`, `/api/api/models` to `/api/models`, and `/api` or `/api/` to `/`. It still uses full-segment matching and stops after the first matching rule. The marker is allowed only as the entire destination; `'/api:'` is invalid, and `'/api:/-'` means the literal destination `/-`.
+- Prefixes are literal **escaped URL paths**, not regex or wildcards; the source and any destination other than `-` must be non-empty and start with `/`, not `//`. No scheme, authority, query, fragment, whitespace, extra literal colon, or malformed percent escape is allowed. Use percent escapes for characters that require URL encoding.
+- No slash normalization or path cleaning is performed, except that prefix deletion ensures a leading `/` and uses `/` for an empty result (so `/api/:-` maps `/api/models` to `/models`). `/api:/v1` maps `/api/` to `/v1/`. Trailing slashes in the rules are literal: `/api/:/v1/` also maps `/api/models` to `/v1/models`, while `/api:/v1/` produces `/v1//models`. For a root prefix, use `/:/v1/` to map `/models` to `/v1/models`.
+- Encoded suffixes are preserved: `/api/a%2Fb%20c` becomes `/v1/a%2Fb%20c`. Encoded separators are not boundaries: `/api%2Fmodels` does not match `/api`; `/%61pi` also does not match `/api`.
+- The query string stays unchanged, including parameter order, repeated values, encoding, and an empty `?`. No matching rule means the original path is retained. `base_url` remains a bare origin — do not put `/v1` there.
+- Rules also work with `target.peer`; each gateway in a chain independently applies its selected target's rules once. They do not change model selection, authentication, body content, or responses.
 
 ### Model routing
 
@@ -91,10 +127,10 @@ keys:
 - `id` is the model name callers put in their requests, `name` is the model name the gateway passes to the provider. When they differ, the gateway rewrites the top-level `model` value of the JSON request body before forwarding; every other body byte stays identical. When they are equal, the body is forwarded unchanged.
 - For a request whose JSON body carries a top-level `model` **string**, the pair (virtual key, model id) picks the entry: the request goes to that entry's target and the token's round-robin counter is not touched. So several entries under one token can route different models to different providers.
 - A `model` value that no entry under the token declares returns `400 Bad Request`; no provider is contacted.
-- Requests without a resolvable `model` — no body, `GET /v1/models`, a non-JSON body, a `model` that is not a string, or a compressed body — are forwarded byte-for-byte unchanged and pick their target by round-robin as before. A missing `model` is then the provider's complaint to relay, not the gateway's.
-- A token whose entries declare no `models` keeps the original behavior exactly: request bodies are never read.
+- Requests without a resolvable `model` — no body, `GET /v1/models`, a non-JSON body, a `model` that is not a string, or a compressed body — keep their bodies byte-for-byte unchanged and pick their target by round-robin as before; any selected target's path rewrite rules still apply. A missing `model` is then the provider's complaint to relay, not the gateway's.
+- A token whose entries declare no `models` still forwards without model validation or rewriting. The gateway inspects the body only to log its top-level `model` string; when available, `model.id` and `model.name` both contain the caller's model name.
 - `id` values must be unique within one token (a duplicate is a startup error); the same `id` under different tokens is fine.
-- This is the only place the gateway reads request bodies. On model-enabled tokens bodies are buffered in memory (up to 32 MiB; beyond that the request is rejected with `413 Request Entity Too Large`), and bodies with a non-identity `Content-Encoding` pass through uninspected and unmodified.
+- Body inspection buffers up to 32 MiB (plus one byte to detect overflow). On model-enabled tokens, larger bodies are rejected with `413 Request Entity Too Large`. On tokens without models, larger bodies pass through without model logging or rejection. Bodies with a non-identity `Content-Encoding` always pass through uninspected and unmodified.
 
 ### Encrypted gateway-to-gateway links (e2ee)
 
@@ -239,7 +275,7 @@ The gateway does not require a `/v1` prefix, nor does it restrict methods or con
 
 ### Forwarding boundaries and errors
 
-- The connection address and HTTP `Host` are updated to the selected target (including non-default ports), so the gateway's local address is never sent to the upstream's virtual host. Beyond that, only authentication is rewritten — plus, on model-enabled keys, the body's top-level `model` value when an alias is configured; the original path (including encoding), query, and remaining application-layer headers stay unchanged. No forwarding headers such as `X-Forwarded-For` are added or appended; existing values are preserved.
+- The connection address and HTTP `Host` are updated to the selected target (including non-default ports), so the gateway's local address is never sent to the upstream's virtual host. Beyond that, authentication is rewritten, the path may be rewritten by the selected target's `rewrite` rules, and on model-enabled keys the body's top-level `model` value may be rewritten when an alias is configured. Without a matching rule the original path (including encoding) stays unchanged; the query and remaining application-layer headers always stay unchanged. No forwarding headers such as `X-Forwarded-For` are added or appended; existing values are preserved.
 - Hop-by-hop headers are handled per standard HTTP proxy rules — e.g. `Connection`, `Keep-Alive`, and any headers it names; the HTTP transport may re-frame the stream, so this is not a byte-level TCP tunnel.
 - Status codes, upstream application-layer response headers, and the body are passed through unchanged; no automatic decompression, SSE is forwarded chunk by chunk, and there is no overall write timeout. Connect timeout is 10 s, response-header timeout 30 s.
 - Missing, malformed, or unknown virtual key: `401 Unauthorized`, and no upstream is contacted.
