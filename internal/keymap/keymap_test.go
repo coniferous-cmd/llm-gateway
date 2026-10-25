@@ -77,6 +77,30 @@ func TestModelResolution(t *testing.T) {
 	}
 }
 
+func TestLongContextSuffixResolution(t *testing.T) {
+	m := New(map[string][]config.Entry{"dev": {
+		{Target: config.Target{BaseURL: "haiku"}, Models: []config.Model{{ID: "claude-haiku-5-5", Name: "deepseek-v4.1-flash"}}},
+		{Target: config.Target{BaseURL: "explicit"}, Models: []config.Model{
+			{ID: "x[1m]", Name: "y[1m]"},
+		}},
+	}})
+	route, _ := m.Select("Bearer dev")
+
+	target, model, ok := route.Resolve("claude-haiku-5-5[1m]")
+	if want := (config.Model{ID: "claude-haiku-5-5[1m]", Name: "deepseek-v4.1-flash[1m]"}); !ok || target.BaseURL != "haiku" || model != want {
+		t.Fatalf("suffixed resolve = %q %+v %v, want %q %+v", target.BaseURL, model, ok, "haiku", want)
+	}
+	// A verbatim declaration wins over the base-id fallback.
+	if target, model, ok := route.Resolve("x[1m]"); !ok || target.BaseURL != "explicit" || model != (config.Model{ID: "x[1m]", Name: "y[1m]"}) {
+		t.Fatalf("explicit suffixed resolve = %q %+v %v", target.BaseURL, model, ok)
+	}
+	for _, id := range []string{"unknown[1m]", "[1m]", "claude-haiku-5-5[1M]"} {
+		if _, _, ok := route.Resolve(id); ok {
+			t.Fatalf("resolved %q", id)
+		}
+	}
+}
+
 func TestLegacyTokenHasNoModels(t *testing.T) {
 	m := New(map[string][]config.Entry{"dev": {{Target: config.Target{BaseURL: "one"}, Models: nil}}})
 	route, _ := m.Select("Bearer dev")

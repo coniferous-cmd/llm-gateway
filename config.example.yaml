@@ -29,6 +29,8 @@ keys:
         - '/anthropic:-'
     # Optional: the models this entry serves. "id" is the model name callers
     # send in their requests, "name" is the model name the provider receives.
+    # A caller id ending in [1m] falls back to the id without that suffix and
+    # the suffix is appended to "name" (e.g. mimo-v2.6-pro[1m]).
     models:
       - id: mimo-v2.6-flash
         name: mimo-v2.6-flash

@@ -59,11 +59,24 @@ func (m *Map) Select(authorization string) (*Route, bool) {
 // HasModels reports whether the token declares model ids for model routing.
 func (r *Route) HasModels() bool { return len(r.byModel) != 0 }
 
-// Resolve maps a caller's model id onto the entry declaring it. Config
-// validation keeps ids unique per token, so the match is unambiguous.
+// longContextSuffix is Claude Code's 1M-context marker on a model id. The base
+// id serves the suffixed variant, with the marker kept on the upstream name.
+const longContextSuffix = "[1m]"
+
+// Resolve maps a caller's model id onto the entry declaring it. A verbatim id
+// wins; otherwise the id without longContextSuffix is tried and the suffix is
+// appended to the entry's upstream name.
 func (r *Route) Resolve(id string) (config.Target, config.Model, bool) {
 	mt, ok := r.byModel[id]
-	return mt.target, mt.model, ok
+	if !ok {
+		base, found := strings.CutSuffix(id, longContextSuffix)
+		mt, ok = r.byModel[base]
+		if !found || !ok {
+			return config.Target{}, config.Model{}, false
+		}
+		mt.model = config.Model{ID: id, Name: mt.model.Name + longContextSuffix}
+	}
+	return mt.target, mt.model, true
 }
 
 // RoundRobin advances the counter for requests without a model match.

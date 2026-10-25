@@ -35,6 +35,7 @@ func TestPrepareModelRouting(t *testing.T) {
 		{"alias rewrite", `{"model":"alias","n":1}`, "flash", "alias", `{"model":"real-model","n":1}`, nil},
 		{"id equals name", "{\n  \"model\": \"same\",\n  \"n\": 1\n}", "flash", "same", "{\n  \"model\": \"same\",\n  \"n\": 1\n}", nil},
 		{"second entry", `{"model":"p","n":1}`, "pro", "p", `{"model":"pro-real","n":1}`, nil},
+		{"long context suffix", `{"model":"alias[1m]","n":1}`, "flash", "alias[1m]", `{"model":"real-model[1m]","n":1}`, nil},
 		{"unknown model id", `{"model":"nope"}`, "", "", "", ErrUnknownModel},
 	}
 	for _, tt := range tests {
