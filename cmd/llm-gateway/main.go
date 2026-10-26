@@ -122,11 +122,13 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	keys := keymap.New(cfg.Keys)
+	recorder := buildConversationRecorder(cfg, logger)
 	// e2ee: parse identity, build the peer dial table for the client-facing
 	// proxy, and listen for encrypted connections from peer gateways.
 	var peers map[string]proxy.PeerDialer
 	var e2eeSrv *http.Server
 	var e2eeLn net.Listener
+	var e2eeDone chan struct{}
 	if cfg.E2EE != nil {
 		identity, peersTable, allowed, err := buildE2EE(cfg, logger)
 		if err != nil {
@@ -143,18 +145,20 @@ func main() {
 			os.Exit(1)
 		}
 		wrapped := e2ee.NewListener(e2eeLn, identity, allowed, logger)
-		e2eeSrv = server.NewWithPeers(cfg.E2EE.Listen, keys, logger, peers)
+		e2eeSrv = server.NewWithRecorder(cfg.E2EE.Listen, keys, logger, peers, recorder)
 		logger.Info("e2ee listening", "listen", cfg.E2EE.Listen, "peers", len(cfg.E2EE.Peers))
+		e2eeDone = make(chan struct{})
 		go func() {
+			defer close(e2eeDone)
 			if err := server.Serve(ctx, e2eeSrv, wrapped); err != nil {
 				logger.Error("e2ee server failed", "error", err)
 				stop()
 			}
 		}()
 	}
-	srv := server.NewWithPeers(cfg.Listen, keys, logger, peers)
+	srv := server.NewWithRecorder(cfg.Listen, keys, logger, peers, recorder)
 	logger.Info("starting", "listen", cfg.Listen, "version", version)
-	if err := server.Run(ctx, srv); err != nil {
+	if err := runAndDrain(func() error { return server.Run(ctx, srv) }, stop, e2eeDone); err != nil {
 		logger.Error("server failed", "error", err)
 		os.Exit(1)
 	}

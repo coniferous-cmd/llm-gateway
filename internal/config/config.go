@@ -124,7 +124,8 @@ type Entry struct {
 }
 
 type Config struct {
-	Listen string
+	ConversationLog ConversationLog
+	Listen          string
 	// E2EE is nil when the gateway has no encrypted peer channel.
 	E2EE *E2EE
 	Keys map[string][]Entry
@@ -135,7 +136,18 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
-	return Parse(data)
+	cfg, err := Parse(data)
+	if err != nil {
+		return nil, err
+	}
+	if !filepath.IsAbs(cfg.ConversationLog.Directory) {
+		base, err := filepath.Abs(filepath.Dir(path))
+		if err != nil {
+			return nil, fmt.Errorf("resolve config directory: %w", err)
+		}
+		cfg.ConversationLog.Directory = filepath.Join(base, cfg.ConversationLog.Directory)
+	}
+	return cfg, nil
 }
 
 func Parse(data []byte) (*Config, error) {
@@ -177,6 +189,11 @@ func Parse(data []byte) (*Config, error) {
 		cfg.Listen = DefaultListen
 	}
 	root := doc.Content[0]
+	conversationLog, err := parseConversationLog(root)
+	if err != nil {
+		return nil, err
+	}
+	cfg.ConversationLog = conversationLog
 	peerByName := map[string]Peer{}
 	var e2eeNode *yaml.Node
 	if raw.E2EE != nil {

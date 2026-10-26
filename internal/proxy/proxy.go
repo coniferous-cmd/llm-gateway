@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"time"
 
+	"llm-gateway/internal/conversationlog"
 	"llm-gateway/internal/keymap"
 )
 
@@ -54,7 +55,14 @@ func New(peers map[string]PeerDialer) http.Handler {
 				r.Header.Set("Authorization", "Bearer "+target.APIKey)
 			}
 		},
-		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, _ error) {
+		ModifyResponse: func(resp *http.Response) error {
+			if call := conversationlog.FromContext(resp.Request.Context()); call != nil {
+				resp.Body = call.ObserveUpstream(resp.Body)
+			}
+			return nil
+		},
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, _ error) {
+			conversationlog.FromContext(r.Context()).Fail("upstream_transport")
 			http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		},
 	}

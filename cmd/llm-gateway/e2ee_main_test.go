@@ -128,6 +128,7 @@ keys:
   - token: sk-virt-to-c
     target: {base_url: %q, api_key: real-upstream}
 `, cListen, cE2EE, cPriv, bE2EE, bPub, upstream.URL)
+	cData += "conversation_log: {enabled: true, directory: c-conversations}\n"
 	if err := os.WriteFile(cConfig, []byte(cData), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -145,6 +146,7 @@ keys:
   - token: virtual
     target: {peer: gateway-c, api_key: sk-virt-to-c}
 `, bListen, bE2EE, bPriv, cE2EE, cPub)
+	bData += "conversation_log: {enabled: true, directory: b-conversations}\n"
 	if err := os.WriteFile(bConfig, []byte(bData), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -177,6 +179,12 @@ keys:
 	n, _ := resp.Body.Read(body)
 	if resp.StatusCode != 200 || string(body[:n]) != "through-c" {
 		t.Fatalf("status=%d body=%q", resp.StatusCode, body[:n])
+	}
+	for _, name := range []string{"b-conversations", "c-conversations"} {
+		record := waitConversationRecord(t, filepath.Join(dir, name))
+		if record.Request.Data != `{"model":"m"}` || record.Response.Data != "through-c" || !record.ResponseComplete {
+			t.Fatalf("%s record: %+v", name, record)
+		}
 	}
 	if calls.Load() != 1 || gotAuth.Load() != "Bearer real-upstream" || gotPath.Load() != "/v1/chat/completions?q=1" {
 		t.Fatalf("upstream: calls=%d auth=%v path=%v", calls.Load(), gotAuth.Load(), gotPath.Load())

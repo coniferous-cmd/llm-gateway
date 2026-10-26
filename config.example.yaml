@@ -1,5 +1,17 @@
 listen: "127.0.0.1:8080"
 
+# Optional: one JSON conversation file per authenticated API call.
+# Disabled by default. Paths are relative to this config file, also in daemon mode.
+# Bodies are UNREDACTED, plaintext at rest (even for encrypted peer traffic).
+# Protect directory permissions/Windows ACLs and manage retention externally;
+# no automatic deletion. Headers and URL queries are not stored.
+# Streaming is forwarded immediately; the file is finalized when the call ends.
+# Crashes may lose active records. Slow storage can delay handler cleanup.
+#conversation_log:
+#  enabled: true
+#  directory: logs/conversations
+#  max_body_bytes: 8388608 # 8 MiB per body; larger content is marked truncated
+
 # Optional: encrypted gateway-to-gateway channel (Noise IK over X25519).
 # Generate the identity with `llm-gateway --keygen`; keep identity_key secret
 # on this machine and hand identity_pub to the peer operator out of band.
