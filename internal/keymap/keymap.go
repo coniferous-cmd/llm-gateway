@@ -5,6 +5,7 @@ import (
 	"context"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"llm-gateway/internal/config"
 )
@@ -44,7 +45,23 @@ func New(keys map[string][]config.Entry) *Map {
 	return m
 }
 
-// Select authenticates the Bearer header and returns the token's route. The
+// expired reports whether the target's expiry timestamp, when set, has passed.
+func expired(t config.Target) bool {
+	return !t.Expire.IsZero() && !time.Now().Before(t.Expire.Time)
+}
+
+// HasLive reports whether any entry of the token is not past its expire time.
+func (r *Route) HasLive() bool {
+	for i := range r.entries {
+		if !expired(r.entries[i].Target) {
+			return true
+		}
+	}
+	return false
+}
+
+// Select authenticates the Bearer header and returns the token's route. A
+// token whose every entry has expired authenticates as an unknown token: the
 // round-robin counter advances only in RoundRobin, so model-matched and
 // rejected requests never shift the rotation.
 func (m *Map) Select(authorization string) (*Route, bool) {
@@ -53,7 +70,10 @@ func (m *Map) Select(authorization string) (*Route, bool) {
 		return nil, false
 	}
 	r, ok := m.routes[fields[1]]
-	return r, ok
+	if !ok || !r.HasLive() {
+		return nil, false
+	}
+	return r, true
 }
 
 // HasModels reports whether the token declares model ids for model routing.
@@ -76,12 +96,23 @@ func (r *Route) Resolve(id string) (config.Target, config.Model, bool) {
 		}
 		mt.model = config.Model{ID: id, Name: mt.model.Name + longContextSuffix}
 	}
+	if expired(mt.target) {
+		return config.Target{}, config.Model{}, false
+	}
 	return mt.target, mt.model, true
 }
 
-// RoundRobin advances the counter for requests without a model match.
+// RoundRobin advances the counter for requests without a model match, cycling
+// through entries that are not past their expire time.
 func (r *Route) RoundRobin() config.Target {
-	index := (r.next.Add(1) - 1) % uint64(len(r.entries))
+	n := 0
+	for i := range r.entries {
+		if !expired(r.entries[i].Target) {
+			r.entries[n] = r.entries[i]
+			n++
+		}
+	}
+	index := (r.next.Add(1) - 1) % uint64(n)
 	return r.entries[index].Target
 }
 

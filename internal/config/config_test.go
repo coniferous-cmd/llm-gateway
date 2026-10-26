@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParse(t *testing.T) {
@@ -47,6 +48,44 @@ func TestParse(t *testing.T) {
 			}
 			if cfg.Keys["dev"][0].Target.BaseURL != "https://example.com" {
 				t.Fatal(cfg.Keys)
+			}
+		})
+	}
+}
+
+func TestParseExpire(t *testing.T) {
+	tests := []struct {
+		name, yaml, wantError string
+		wantZero, wantAfter   bool // zero time / after a fixed reference
+	}{
+		{"rfc3339", "keys:\n  - token: dev\n    target:\n      base_url: https://example.com\n      expire: '2026-11-01T00:00:00Z'\n", "", false, true},
+		{"unix seconds", "keys:\n  - token: dev\n    target:\n      base_url: https://example.com\n      expire: 1800000000\n", "", false, true},
+		{"zero never expires", "keys:\n  - token: dev\n    target:\n      base_url: https://example.com\n      expire: 0\n", "", true, false},
+		{"none", "keys:\n  - token: dev\n    target:\n      base_url: https://example.com\n", "", true, false},
+		{"empty value", "keys:\n  - token: dev\n    target:\n      base_url: https://example.com\n      expire:\n", "", true, false},
+		{"invalid string", "keys:\n  - token: dev\n    target:\n      base_url: https://example.com\n      expire: tomorrow\n", "expire must be", false, false},
+		{"invalid type", "keys:\n  - token: dev\n    target:\n      base_url: https://example.com\n      expire: [1, 2]\n", "expire must be", false, false},
+		{"long past", "keys:\n  - token: dev\n    target:\n      base_url: https://example.com\n      expire: 1\n", "", false, false},
+		{"far future", "keys:\n  - token: dev\n    target:\n      base_url: https://example.com\n      expire: 4000000000\n", "", false, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := Parse([]byte(tt.yaml))
+			if tt.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+					t.Fatalf("error = %v, want %q", err, tt.wantError)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := cfg.Keys["dev"][0].Target.Expire
+			if got.IsZero() != tt.wantZero {
+				t.Fatalf("Expire.IsZero = %v, want %v (%v)", got.IsZero(), tt.wantZero, got)
+			}
+			if !got.IsZero() && got.After(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)) != tt.wantAfter {
+				t.Fatalf("Expire = %v, unexpected decade", got)
 			}
 		})
 	}

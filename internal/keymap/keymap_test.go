@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"llm-gateway/internal/config"
 )
@@ -98,6 +99,50 @@ func TestLongContextSuffixResolution(t *testing.T) {
 		if _, _, ok := route.Resolve(id); ok {
 			t.Fatalf("resolved %q", id)
 		}
+	}
+}
+
+func TestExpiredEntries(t *testing.T) {
+	past := config.Target{BaseURL: "expired", Expire: config.ExpireAt{Time: time.Now().Add(-time.Minute)}}
+	live := config.Target{BaseURL: "live"}
+	m := New(map[string][]config.Entry{"dev": {
+		{Target: past},
+		{Target: live},
+	}, "gone": {
+		{Target: past},
+	}, "modelless": {
+		{Target: past, Models: []config.Model{{ID: "f", Name: "f"}}},
+	}})
+	// Select misses a token whose every entry expired; live entries pin the
+	// round-robin to the survivors.
+	route, ok := m.Select("Bearer gone")
+	if ok || route != nil {
+		t.Fatal("all-expired token selected")
+	}
+	route, ok = m.Select("Bearer dev")
+	if !ok {
+		t.Fatal("mixed token selected none")
+	}
+	// Round-robin must only pick live entries.
+	for i := 0; i < 6; i++ {
+		if got := route.RoundRobin().BaseURL; got != "live" {
+			t.Fatalf("rotation picked expired entry %q", got)
+		}
+	}
+	// A model whose only entry expired no longer resolves.
+	if _, _, ok := route.Resolve("f"); ok {
+		t.Fatal("expired target resolved by model")
+	}
+	if _, _, ok := route.Resolve("f[1m]"); ok {
+		t.Fatal("expired target resolved via long-context fallback")
+	}
+	if _, ok := m.Select("Bearer gone"); ok {
+		t.Fatal("expired-only token selected")
+	}
+	// An unset expire never expires.
+	future := config.Target{BaseURL: "future", Expire: config.ExpireAt{Time: time.Now().Add(time.Hour)}}
+	if expired(future) || expired(config.Target{}) {
+		t.Fatal("unset or future expire treated as expired")
 	}
 }
 

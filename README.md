@@ -56,6 +56,7 @@ keys:
 - A non-empty `api_key` becomes `Authorization: Bearer <api_key>`; do not include `Bearer ` in the config value.
 - A target may declare `rewrite`, an ordered list of path prefix rules — see [path rewriting](#path-rewriting). This field belongs inside `target`, not alongside `token`.
 - An entry may declare `models` — the model names it serves — turning on [model routing](#model-routing) for that token.
+- A target may declare `expire`, an timestamp after which the provider stops being used: RFC3339 (`'2026-11-01T00:00:00Z'`) or Unix seconds (`1800000000`). The check runs per request, so an entry expires without a restart; round-robin skips it, and a model whose only declaring entry expired answers `400 unknown model id`. A token whose every entry has expired authenticates as unknown (`401`). `0` or an omitted `expire` never expires.
 - Declaring the same `token` again appends another target in config order; each authenticated request round-robins through them, with counters kept per token. Only put upstreams that are compatible in protocol and model names under the same token.
 - The config is loaded once at startup; changes require a restart. Startup validation failures report the offending field and exit.
 - The config contains plaintext secrets — never commit a real config; the default `.gitignore` already excludes `config.yaml`. Restrict file permissions and prefer listening on loopback only.

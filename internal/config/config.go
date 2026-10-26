@@ -7,7 +7,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -45,6 +47,36 @@ type RewriteRule struct {
 	Destination string
 }
 
+// ExpireAt is one parsed target expiry timestamp. Zero (an omitted or empty
+// expire, or the explicit value 0) means the target never expires.
+type ExpireAt struct{ time.Time }
+
+// UnmarshalYAML accepts either an RFC3339 UTC-ish string or a Unix-seconds
+// integer; anything else is a decode error naming the allowed forms. A Unix
+// value of 0 explicitly means "never expires", not 1970.
+func (e *ExpireAt) UnmarshalYAML(node *yaml.Node) error {
+	if node.Tag == "!!null" {
+		return nil
+	}
+	if node.Tag == "!!int" {
+		sec, err := strconv.ParseInt(node.Value, 10, 64)
+		if err != nil {
+			return fmt.Errorf("expire must be an RFC3339 timestamp or Unix seconds, not %q", node.Value)
+		}
+		if sec == 0 {
+			return nil
+		}
+		e.Time = time.Unix(sec, 0)
+		return nil
+	}
+	var t time.Time
+	if err := node.Decode(&t); err != nil {
+		return fmt.Errorf("expire must be an RFC3339 timestamp or Unix seconds")
+	}
+	e.Time = t
+	return nil
+}
+
 type Target struct {
 	BaseURL string `yaml:"base_url"`
 	APIKey  string `yaml:"api_key"`
@@ -52,6 +84,10 @@ type Target struct {
 	// encrypted Noise session instead of plain HTTP. Mutually exclusive with
 	// BaseURL.
 	Peer string `yaml:"peer"`
+	// Expire, when non-zero, disables this target once the current wall clock
+	// passes the timestamp: requests stop routing to it at use time, without a
+	// restart. Accepted YAML forms are RFC3339 strings or Unix-seconds numbers.
+	Expire ExpireAt `yaml:"expire"`
 	// Rewrite belongs to this target and is immutable after startup.
 	Rewrite []RewriteRule `yaml:"-"`
 }

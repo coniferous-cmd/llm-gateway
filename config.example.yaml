@@ -45,7 +45,15 @@ keys:
   #    rewrite:
   #      - '/api:/v2'
   #      - '/openai:/v2'
-  # api_key is optional for upstreams that do not require authentication.
+    # api_key is optional for upstreams that do not require authentication.
+  # Optional: expire disables this target once the current time passes the
+  # timestamps — RFC3339 or Unix seconds. No provider is contacted afterwards,
+  # without a restart; omitted expire or 0 means the target never expires.
+  #- token: sk-virt-expiring
+  #  target:
+  #    base_url: https://api.openai.com
+  #    api_key: sk-real-replace-me
+  #    expire: '2026-11-01T00:00:00Z' # or a unix timestamp, e.g. 1800000000
   - token: sk-virt-local
     target:
       base_url: http://127.0.0.1:11434/
