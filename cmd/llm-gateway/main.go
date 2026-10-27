@@ -37,7 +37,31 @@ func main() {
 	pidPath := flag.String("pid-file", "", "path to the pid file (default ~/.config/llm-gateway/llm-gateway.pid)")
 	versionFlag := flag.Bool("version", false, "print version and exit")
 	keygenFlag := flag.Bool("keygen", false, "generate an e2ee identity keypair and exit")
+	checkFlag := flag.Bool("check-config", false, "validate configuration offline and exit (0 valid, 1 invalid); no startup side effects; conflicts with --daemon, --stop, --keygen, --version; ignores --log-file and --pid-file")
 	flag.Parse()
+	if *checkFlag {
+		for _, operation := range []struct {
+			name    string
+			enabled bool
+		}{
+			{"--daemon", *background}, {"--stop", *stopFlag}, {"--keygen", *keygenFlag}, {"--version", *versionFlag},
+		} {
+			if operation.enabled {
+				fmt.Fprintln(os.Stderr, "configuration check failed: --check-config cannot be combined with", operation.name)
+				os.Exit(1)
+			}
+		}
+		configPath, err := resolveConfigPath(*path)
+		if err == nil {
+			_, err = config.Load(configPath)
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "configuration check failed:", err)
+			os.Exit(1)
+		}
+		fmt.Println("configuration valid:", configPath)
+		return
+	}
 	if *keygenFlag {
 		if err := e2ee.GenerateKeyPair(os.Stdout); err != nil {
 			fmt.Fprintln(os.Stderr, "keygen failed:", err)
@@ -72,14 +96,10 @@ func main() {
 		logger.Info("stopped", "pid", pid, "pid_file", pidFile)
 		return
 	}
-	configPath := *path
-	if configPath == "" {
-		defaultPath, err := config.DefaultPath()
-		if err != nil {
-			logger.Error("configuration failed", "error", err)
-			os.Exit(1)
-		}
-		configPath = defaultPath
+	configPath, err := resolveConfigPath(*path)
+	if err != nil {
+		logger.Error("configuration failed", "error", err)
+		os.Exit(1)
 	}
 	if *background {
 		if err := runBackground(logger, configPath, *logPath, pidFile); err != nil {
@@ -162,6 +182,13 @@ func main() {
 		logger.Error("server failed", "error", err)
 		os.Exit(1)
 	}
+}
+
+func resolveConfigPath(path string) (string, error) {
+	if path != "" {
+		return path, nil
+	}
+	return config.DefaultPath()
 }
 
 // buildE2EE parses the configured identity and builds one Noise dialer per

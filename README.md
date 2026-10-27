@@ -216,6 +216,22 @@ Both `--config` and `-config` work; when omitted, `~/.config/llm-gateway/config.
 
 Press Ctrl+C to shut down; SIGTERM is also supported on POSIX systems. After a shutdown signal, in-flight requests get up to 10 seconds to finish before connections are closed.
 
+### Check configuration before starting
+
+```sh
+./bin/llm-gateway --check-config --config ./config.yaml
+# Or check the default ~/.config/llm-gateway/config.yaml:
+./bin/llm-gateway --check-config
+```
+
+On Windows, use `.\bin\llm-gateway.exe` with the same arguments.
+
+- A valid configuration prints `configuration valid: <path>` to stdout and exits **0**. An invalid or unreadable file reports the reason to stderr and exits **1**, preserving YAML line information where available. The first error is sufficient; fix it and check again.
+- Checking uses the same rules as normal startup: YAML structure, required fields, target/model/rewrite rules, E2EE references, conversation logging, and listener address syntax. **Unknown fields at every supported level and malformed listener addresses now fail during normal startup too**, rather than being ignored or discovered later.
+- Listeners accept an empty host, hostname, IPv4, or bracketed IPv6 plus a numeric port from 0 through 65535 (for example `:8080`, `localhost:8080`, `[::1]:8080`). An omitted or empty listener retains its default. Named service ports are not accepted.
+- This is an **offline check**, not a readiness test: it does not bind ports, resolve DNS, contact providers/peers, verify remote credentials, open log files, touch PID files, create conversation directories, or launch a background process. Success does not guarantee that ports, filesystem permissions, or remote services will be usable at runtime.
+- `--check-config` cannot be combined with `--daemon`, `--stop`, `--keygen`, or `--version`. `--log-file` and `--pid-file` are ignored in check mode.
+
 ### Background mode
 
 `--daemon` starts the gateway detached from the terminal and returns immediately:

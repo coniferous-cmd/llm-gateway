@@ -61,7 +61,7 @@ func (e *ExpireAt) UnmarshalYAML(node *yaml.Node) error {
 	if node.Tag == "!!int" {
 		sec, err := strconv.ParseInt(node.Value, 10, 64)
 		if err != nil {
-			return fmt.Errorf("expire must be an RFC3339 timestamp or Unix seconds, not %q", node.Value)
+			return fmt.Errorf("line %d: expire must be an RFC3339 timestamp or Unix seconds", node.Line)
 		}
 		if sec == 0 {
 			return nil
@@ -158,6 +158,14 @@ func Parse(data []byte) (*Config, error) {
 	if len(doc.Content) == 0 {
 		return nil, fmt.Errorf("config: keys must not be empty")
 	}
+	expanded, err := expandConfigNode(&doc, make(map[*yaml.Node]bool))
+	if err != nil {
+		return nil, err
+	}
+	doc = *expanded
+	if err := validateFields(&doc, configFields); err != nil {
+		return nil, err
+	}
 	var raw struct {
 		Listen string `yaml:"listen"`
 		E2EE   *struct {
@@ -179,7 +187,7 @@ func Parse(data []byte) (*Config, error) {
 		} `yaml:"keys"`
 	}
 	if err := doc.Decode(&raw); err != nil {
-		return nil, fmt.Errorf("decode config: %w", err)
+		return nil, fmt.Errorf("decode config: %w", safeDecodeError(err))
 	}
 	if len(raw.Keys) == 0 {
 		return nil, fmt.Errorf("config: keys must not be empty")
@@ -189,6 +197,9 @@ func Parse(data []byte) (*Config, error) {
 		cfg.Listen = DefaultListen
 	}
 	root := doc.Content[0]
+	if err := validateListen(field(root, "listen"), "listen", cfg.Listen); err != nil {
+		return nil, err
+	}
 	conversationLog, err := parseConversationLog(root)
 	if err != nil {
 		return nil, err
@@ -201,6 +212,9 @@ func Parse(data []byte) (*Config, error) {
 		cfg.E2EE = &E2EE{Listen: raw.E2EE.Listen, IdentityKey: raw.E2EE.IdentityKey}
 		if cfg.E2EE.Listen == "" {
 			cfg.E2EE.Listen = DefaultE2EEListen
+		}
+		if err := validateListen(field(e2eeNode, "listen"), "e2ee.listen", cfg.E2EE.Listen); err != nil {
+			return nil, err
 		}
 		if err := validateIdentityKey(field(e2eeNode, "identity_key"), raw.E2EE.IdentityKey); err != nil {
 			return nil, err
@@ -269,7 +283,7 @@ func Parse(data []byte) (*Config, error) {
 			return nil, err
 		}
 		entry.Target.Target.Rewrite = rules
-		models, err := validateModels(field(node, "models"), entry.Token, cfg.Keys[entry.Token], entry.Models, i)
+		models, err := validateModels(field(node, "models"), cfg.Keys[entry.Token], entry.Models, i)
 		if err != nil {
 			return nil, err
 		}
@@ -351,7 +365,7 @@ func peerLine(node *yaml.Node, section *yaml.Node) int {
 
 // validateModels checks one entry's models against the token's already accepted
 // entries: id and name must be non-empty, and id must be unique per token.
-func validateModels(node *yaml.Node, token string, prior []Entry, models []Model, keyIndex int) ([]Model, error) {
+func validateModels(node *yaml.Node, prior []Entry, models []Model, keyIndex int) ([]Model, error) {
 	seen := make(map[string]struct{})
 	for _, entry := range prior {
 		for _, model := range entry.Models {
@@ -367,7 +381,7 @@ func validateModels(node *yaml.Node, token string, prior []Entry, models []Model
 			return nil, fmt.Errorf("line %d: keys[%d].models[%d].name is required", field(item, "name").Line, keyIndex, j)
 		}
 		if _, dup := seen[model.ID]; dup {
-			return nil, fmt.Errorf("line %d: keys[%d].models[%d].id %q is already declared for token %q", field(item, "id").Line, keyIndex, j, model.ID, token)
+			return nil, fmt.Errorf("line %d: keys[%d].models[%d].id %q is already declared for this token", field(item, "id").Line, keyIndex, j, model.ID)
 		}
 		seen[model.ID] = struct{}{}
 	}
