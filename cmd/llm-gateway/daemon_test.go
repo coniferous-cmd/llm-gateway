@@ -28,10 +28,19 @@ func buildBinary(t *testing.T, dir string) string {
 	return binary
 }
 
-// Exercise --daemon, --stop, --log-file and --pid-file with the real binary.
+// Exercise legacy flags and subcommands with the real binary.
 func TestDaemonStop(t *testing.T) {
+	binary := buildBinary(t, t.TempDir())
+	for _, mode := range []string{"legacy", "commands"} {
+		t.Run(mode, func(t *testing.T) {
+			testDaemonStop(t, binary, mode == "commands")
+		})
+	}
+}
+
+func testDaemonStop(t *testing.T, binary string, subcommands bool) {
+	t.Helper()
 	dir := t.TempDir()
-	binary := buildBinary(t, dir)
 	logs := func() string {
 		content, _ := os.ReadFile(filepath.Join(dir, "gateway.log"))
 		return string(content)
@@ -53,6 +62,11 @@ func TestDaemonStop(t *testing.T) {
 	pidFile := filepath.Join(dir, "gateway.pid")
 	logPath := filepath.Join(dir, "gateway.log")
 	daemonArgs := []string{"--daemon", "--config", configPath, "--pid-file", pidFile, "--log-file", logPath}
+	stopArgs := []string{"--stop", "--pid-file", pidFile}
+	if subcommands {
+		daemonArgs = append([]string{"serve"}, daemonArgs...)
+		stopArgs[0] = "stop"
+	}
 	output, err := exec.Command(binary, daemonArgs...).CombinedOutput()
 	if err != nil {
 		t.Fatalf("daemon start: %v\n%s\nlogs:\n%s", err, output, logs())
@@ -68,6 +82,9 @@ func TestDaemonStop(t *testing.T) {
 	if err != nil || pid <= 0 {
 		t.Fatalf("pid file contents %q", pidData)
 	}
+	t.Cleanup(func() {
+		_ = exec.Command(binary, stopArgs...).Run()
+	})
 	t.Logf("gateway runs as pid %d", pid)
 	client := &http.Client{Timeout: 250 * time.Millisecond}
 	defer client.CloseIdleConnections()
@@ -90,7 +107,7 @@ func TestDaemonStop(t *testing.T) {
 	if err == nil || !strings.Contains(string(output), "already running") {
 		t.Fatalf("second daemon start: %v\n%s\nlogs:\n%s", err, output, logs())
 	}
-	if output, err := exec.Command(binary, "--stop", "--pid-file", pidFile).CombinedOutput(); err != nil {
+	if output, err := exec.Command(binary, stopArgs...).CombinedOutput(); err != nil {
 		t.Fatalf("stop: %v\n%s\nlogs:\n%s", err, output, logs())
 	}
 	if _, err := os.Stat(pidFile); !os.IsNotExist(err) {
@@ -108,7 +125,7 @@ func TestDaemonStop(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	output, err = exec.Command(binary, "--stop", "--pid-file", pidFile).CombinedOutput()
+	output, err = exec.Command(binary, stopArgs...).CombinedOutput()
 	if err == nil || !strings.Contains(string(output), "not running") {
 		t.Fatalf("second stop: %v\n%s", err, output)
 	}

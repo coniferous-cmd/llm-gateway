@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"log/slog"
 	"net"
@@ -30,114 +29,40 @@ const stopGrace = 12 * time.Second
 var version = "dev"
 
 func main() {
-	path := flag.String("config", "", "path to YAML configuration (default ~/.config/llm-gateway/config.yaml)")
-	background := flag.Bool("daemon", false, "run detached from the terminal; logs go to --log-file, use --stop to shut down")
-	stopFlag := flag.Bool("stop", false, "stop the gateway recorded in the pid file")
-	logPath := flag.String("log-file", "", "append logs to this file instead of stdout (default with --daemon: ~/.config/llm-gateway/llm-gateway.log)")
-	pidPath := flag.String("pid-file", "", "path to the pid file (default ~/.config/llm-gateway/llm-gateway.pid)")
-	versionFlag := flag.Bool("version", false, "print version and exit")
-	keygenFlag := flag.Bool("keygen", false, "generate an e2ee identity keypair and exit")
-	checkFlag := flag.Bool("check-config", false, "validate configuration offline and exit (0 valid, 1 invalid); no startup side effects; conflicts with --daemon, --stop, --keygen, --version; ignores --log-file and --pid-file")
-	flag.Parse()
-	if *checkFlag {
-		for _, operation := range []struct {
-			name    string
-			enabled bool
-		}{
-			{"--daemon", *background}, {"--stop", *stopFlag}, {"--keygen", *keygenFlag}, {"--version", *versionFlag},
-		} {
-			if operation.enabled {
-				fmt.Fprintln(os.Stderr, "configuration check failed: --check-config cannot be combined with", operation.name)
-				os.Exit(1)
-			}
-		}
-		configPath, err := resolveConfigPath(*path)
-		if err == nil {
-			_, err = config.Load(configPath)
-		}
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "configuration check failed:", err)
-			os.Exit(1)
-		}
-		fmt.Println("configuration valid:", configPath)
-		return
-	}
-	if *keygenFlag {
-		if err := e2ee.GenerateKeyPair(os.Stdout); err != nil {
-			fmt.Fprintln(os.Stderr, "keygen failed:", err)
-			os.Exit(1)
-		}
-		return
-	}
-	if *versionFlag {
-		fmt.Println("llm-gateway", version)
-		return
-	}
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	if *background && *stopFlag {
-		logger.Error("configuration failed", "error", fmt.Errorf("--daemon and --stop cannot be combined"))
-		os.Exit(1)
-	}
-	pidFile := *pidPath
-	if pidFile == "" {
-		resolved, err := defaultFile("llm-gateway.pid")
-		if err != nil {
-			logger.Error("configuration failed", "error", err)
-			os.Exit(1)
-		}
-		pidFile = resolved
-	}
-	if *stopFlag {
-		pid, err := daemon.Stop(pidFile, stopGrace)
-		if err != nil {
-			logger.Error("stop failed", "error", err, "pid_file", pidFile)
-			os.Exit(1)
-		}
-		logger.Info("stopped", "pid", pid, "pid_file", pidFile)
-		return
-	}
-	configPath, err := resolveConfigPath(*path)
-	if err != nil {
-		logger.Error("configuration failed", "error", err)
-		os.Exit(1)
-	}
-	if *background {
-		if err := runBackground(logger, configPath, *logPath, pidFile); err != nil {
-			logger.Error("background start failed", "error", err)
-			os.Exit(1)
-		}
-		return
-	}
+	os.Exit(runCLI(os.Args[1:], os.Stdout, os.Stderr))
+}
+
+func runForeground(opts options, configPath string, logger *slog.Logger) (result error) {
 	cfg, err := config.Load(configPath)
 	if err != nil {
-		logger.Error("configuration failed", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("configuration failed: %w", err)
 	}
-	if *logPath != "" {
-		log, err := os.OpenFile(*logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if opts.logPath != "" {
+		log, err := os.OpenFile(opts.logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 		if err != nil {
-			logger.Error("configuration failed", "error", fmt.Errorf("open log file %s: %w", *logPath, err))
-			os.Exit(1)
+			return fmt.Errorf("configuration failed: open log file %s: %w", opts.logPath, err)
 		}
 		defer log.Close()
-		os.Stdout, os.Stderr = log, log
-		logger = slog.New(slog.NewJSONHandler(os.Stdout, nil))
+		logger = slog.New(slog.NewJSONHandler(log, nil))
+		defer func() {
+			if result != nil {
+				logger.Error("command failed", "error", result)
+				result = &cliError{err: result, code: 1, reported: true}
+			}
+		}()
 	}
-	if *pidPath != "" {
-		held, err := daemon.RunningPID(*pidPath)
+	if opts.pidPath != "" {
+		held, err := daemon.RunningPID(opts.pidPath)
 		if err != nil {
-			logger.Error("configuration failed", "error", err)
-			os.Exit(1)
+			return fmt.Errorf("configuration failed: %w", err)
 		}
 		if held != 0 {
-			logger.Error("configuration failed", "error", fmt.Errorf("gateway is already running with pid %d (pid file %s)", held, *pidPath))
-			os.Exit(1)
+			return fmt.Errorf("configuration failed: gateway is already running with pid %d (pid file %s)", held, opts.pidPath)
 		}
-		if err := daemon.WritePID(*pidPath, os.Getpid()); err != nil {
-			logger.Error("configuration failed", "error", err)
-			os.Exit(1)
+		if err := daemon.WritePID(opts.pidPath, os.Getpid()); err != nil {
+			return fmt.Errorf("configuration failed: %w", err)
 		}
-		defer daemon.RemovePID(*pidPath, os.Getpid())
+		defer daemon.RemovePID(opts.pidPath, os.Getpid())
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -152,8 +77,7 @@ func main() {
 	if cfg.E2EE != nil {
 		identity, peersTable, allowed, err := buildE2EE(cfg, logger)
 		if err != nil {
-			logger.Error("configuration failed", "error", err)
-			os.Exit(1)
+			return fmt.Errorf("configuration failed: %w", err)
 		}
 		peers = make(map[string]proxy.PeerDialer, len(peersTable))
 		for addr, dialer := range peersTable {
@@ -161,8 +85,7 @@ func main() {
 		}
 		e2eeLn, err = net.Listen("tcp", cfg.E2EE.Listen)
 		if err != nil {
-			logger.Error("e2ee listen failed", "error", err, "listen", cfg.E2EE.Listen)
-			os.Exit(1)
+			return fmt.Errorf("e2ee listen failed (%s): %w", cfg.E2EE.Listen, err)
 		}
 		wrapped := e2ee.NewListener(e2eeLn, identity, allowed, logger)
 		e2eeSrv = server.NewWithRecorder(cfg.E2EE.Listen, keys, logger, peers, recorder)
@@ -179,9 +102,9 @@ func main() {
 	srv := server.NewWithRecorder(cfg.Listen, keys, logger, peers, recorder)
 	logger.Info("starting", "listen", cfg.Listen, "version", version)
 	if err := runAndDrain(func() error { return server.Run(ctx, srv) }, stop, e2eeDone); err != nil {
-		logger.Error("server failed", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("server failed: %w", err)
 	}
+	return nil
 }
 
 func resolveConfigPath(path string) (string, error) {

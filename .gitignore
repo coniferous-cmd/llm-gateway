@@ -12,5 +12,7 @@ coverage.out
 /config.local.yml
 
 # Editor and OS files
+.idea/
 .DS_Store
 Thumbs.db
+/vendor/

@@ -200,6 +200,21 @@ Rules and guarantees:
 
 ## Running
 
+The CLI uses subcommands. With no command it runs in the foreground, as before:
+
+```sh
+llm-gateway serve --config ./config.yaml
+llm-gateway serve --daemon --config ./config.yaml
+llm-gateway stop
+llm-gateway check-config --config ./config.yaml
+llm-gateway keygen
+llm-gateway version
+```
+
+Use `llm-gateway --help` or `<command> --help` for usage. Flags belong to each command: `serve` accepts `--config`, `--daemon`, `--log-file`, and `--pid-file`; `stop` accepts `--pid-file`; `check-config` accepts only `--config`; `keygen` and `version` need no flags. Put flags after the command. Shell completion is available through `llm-gateway completion bash|zsh|fish|powershell`.
+
+Existing root-level flags (`--daemon`, `--stop`, `--check-config`, `--keygen`, `--version`) remain supported, including their original precedence and conflict rules. Invalid command/flag usage exits **2**; operational failures exit **1**.
+
 Linux / macOS:
 
 ```sh
@@ -219,9 +234,9 @@ Press Ctrl+C to shut down; SIGTERM is also supported on POSIX systems. After a s
 ### Check configuration before starting
 
 ```sh
-./bin/llm-gateway --check-config --config ./config.yaml
+./bin/llm-gateway check-config --config ./config.yaml
 # Or check the default ~/.config/llm-gateway/config.yaml:
-./bin/llm-gateway --check-config
+./bin/llm-gateway check-config
 ```
 
 On Windows, use `.\bin\llm-gateway.exe` with the same arguments.
@@ -230,14 +245,15 @@ On Windows, use `.\bin\llm-gateway.exe` with the same arguments.
 - Checking uses the same rules as normal startup: YAML structure, required fields, target/model/rewrite rules, E2EE references, conversation logging, and listener address syntax. **Unknown fields at every supported level and malformed listener addresses now fail during normal startup too**, rather than being ignored or discovered later.
 - Listeners accept an empty host, hostname, IPv4, or bracketed IPv6 plus a numeric port from 0 through 65535 (for example `:8080`, `localhost:8080`, `[::1]:8080`). An omitted or empty listener retains its default. Named service ports are not accepted.
 - This is an **offline check**, not a readiness test: it does not bind ports, resolve DNS, contact providers/peers, verify remote credentials, open log files, touch PID files, create conversation directories, or launch a background process. Success does not guarantee that ports, filesystem permissions, or remote services will be usable at runtime.
-- `--check-config` cannot be combined with `--daemon`, `--stop`, `--keygen`, or `--version`. `--log-file` and `--pid-file` are ignored in check mode.
+- The `check-config` command rejects unrelated flags such as `--daemon`, `--log-file`, and `--pid-file`. The legacy `--check-config` flag still cannot be combined with `--daemon`, `--stop`, `--keygen`, or `--version`, and continues to ignore `--log-file` and `--pid-file`.
 
 ### Background mode
 
 `--daemon` starts the gateway detached from the terminal and returns immediately:
 
 ```sh
-./bin/llm-gateway --daemon --config ./config.yaml
+./bin/llm-gateway serve --daemon --config ./config.yaml
+./bin/llm-gateway stop
 ```
 
 - The binary re-launches itself as a detached process. JSON logs are appended to `~/.config/llm-gateway/llm-gateway.log` (override with `--log-file`), and the process id is recorded in `~/.config/llm-gateway/llm-gateway.pid` (override with `--pid-file`). The command returns only after the gateway is actually listening; on failure it reports the log file to inspect.
