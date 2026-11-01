@@ -2,7 +2,8 @@ name: Build and release
 
 on:
   push:
-  pull_request:
+    tags:
+      - 'v*'
   workflow_dispatch:
 
 permissions:
@@ -14,6 +15,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: never
+  LLM_GATEWAY_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
 
 jobs:
   test:
@@ -29,9 +31,7 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked --all-targets
 
-  # Rust cannot cross-compile Windows/macOS from Linux the way Go can, so each
-  # target builds on a native runner (or, for the cross-only Linux targets,
-  # through `cross` on a Linux runner).
+  # Use native Windows/macOS runners and cross for non-native Linux targets.
   build:
     name: Build ${{ matrix.name }}
     needs: test
@@ -63,7 +63,7 @@ jobs:
             archive: tar.gz
             use-cross: true
           - name: darwin-amd64
-            runner: macos-13
+            runner: macos-15-intel
             target: x86_64-apple-darwin
             archive: tar.gz
           - name: darwin-arm64
@@ -122,7 +122,7 @@ jobs:
           fi
           cp config.example.yaml "dist/$name/"
           if [[ "${{ matrix.archive }}" == "zip" ]]; then
-            (cd dist && zip -rq "$name.zip" "$name")
+            pwsh -NoProfile -Command "Compress-Archive -Path 'dist/$name' -DestinationPath 'dist/$name.zip'"
           else
             tar -czf "dist/$name.tar.gz" -C dist "$name"
           fi
@@ -141,6 +141,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
       - uses: docker/setup-buildx-action@v3
       - name: Docker metadata
         id: meta
@@ -150,7 +153,7 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
       - name: Login to Docker Hub
         # Push only happens on tags; skip the login (and its secrets) elsewhere.
         if: startsWith(github.ref, 'refs/tags/v')
@@ -162,8 +165,10 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          # Multi-arch only on release tags; plain amd64 build otherwise,
-          # so regular pushes validate the Dockerfile cheaply without QEMU.
+          build-args: |
+            LLM_GATEWAY_VERSION=${{ env.LLM_GATEWAY_VERSION }}
+          # Release tags publish both architectures; manual branch runs only
+          # validate amd64 without pushing an image.
           platforms: ${{ startsWith(github.ref, 'refs/tags/v') && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
           push: ${{ startsWith(github.ref, 'refs/tags/v') }}
           tags: ${{ steps.meta.outputs.tags }}
@@ -187,7 +192,7 @@ jobs:
           merge-multiple: true
       - name: Generate SHA-256 checksums
         working-directory: dist
-        run: sha256sum *.tar.gz *.zip > SHA256SUMS
+        run: sha256sum -- *.tar.gz *.zip > SHA256SUMS
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
