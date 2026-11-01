@@ -2,9 +2,9 @@ use std::io;
 use std::os::windows::process::CommandExt;
 use std::process::Command;
 
-use windows_sys::Win32::Foundation::{CloseHandle, SYNCHRONIZE, WAIT_TIMEOUT};
+use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
 use windows_sys::Win32::System::Threading::{
-    OpenProcess, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
+    OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
 };
 
 /// Run the child without a console of its own.
@@ -17,7 +17,7 @@ pub fn detach(command: &mut Command) {
 /// A zero-timeout wait distinguishes a running process from one whose handle
 /// is merely still held by another process.
 pub fn alive(pid: u32) -> bool {
-    let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
+    let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
     if handle.is_null() {
         return false;
     }
