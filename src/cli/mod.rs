@@ -1146,8 +1146,13 @@ mod tests {
             let (code, stdout, stderr) = invoke(&[command, "--pid-file", &path_text]);
             assert_eq!(code, 1);
             assert!(stderr.is_empty(), "{stderr}");
-            assert!(stdout.contains("stop failed"), "{stdout}");
-            assert!(stdout.contains(&path_text), "{stdout}");
+            let event: serde_json::Value = serde_json::from_str(&stdout)
+                .unwrap_or_else(|error| panic!("invalid JSON: {error}: {stdout}"));
+            assert_eq!(event["level"], "ERROR", "{stdout}");
+            assert_eq!(event["msg"], "command failed", "{stdout}");
+            let error = event["error"].as_str().expect("error must be a string");
+            assert!(error.contains("stop failed"), "{stdout}");
+            assert!(error.contains(&path_text), "{stdout}");
         }
     }
 
