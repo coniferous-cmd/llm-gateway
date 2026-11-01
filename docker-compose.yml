@@ -1,0 +1,27 @@
+services:
+  llm-gateway:
+    # Build from the local Dockerfile. Delete this `build` line to only pull
+    # the published multi-arch image from Docker Hub instead.
+    image: kunxu984/coniferous-cmd:latest
+    build: .
+    container_name: llm-gateway
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      # config.yaml must set `listen: 0.0.0.0:8080` — 127.0.0.1 inside the
+      # container would reject the port mapping. The file must exist before
+      # `docker compose up`, otherwise Docker creates a directory in its place.
+      - ./config.yaml:/etc/llm-gateway/config.yaml:ro
+    # Lets the container reach host services (e.g. Ollama on :11434) via
+    # host.docker.internal — required on Linux, harmless on Docker Desktop.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      # /ready answers 401 without a token, so probe the port instead of the
+      # endpoint: any HTTP response still means the gateway is listening.
+      test: ["CMD", "nc", "-z", "127.0.0.1", "8080"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s

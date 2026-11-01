@@ -1,0 +1,80 @@
+name: Rust verification
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --locked
+      - name: Test
+        run: cargo test --locked --all-targets
+
+  lint:
+    name: clippy and rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --check
+      - name: clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+  cross-compile:
+    name: cross-compile ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            use-cross: false
+          - target: aarch64-unknown-linux-gnu
+            use-cross: true
+          - target: aarch64-unknown-linux-musl
+            use-cross: true
+          - target: armv7-unknown-linux-musleabihf
+            use-cross: true
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl' && !matrix.use-cross
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+      - name: Build with cross
+        if: matrix.use-cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - name: cargo build (native linker)
+        if: ${{ !matrix.use-cross }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: cargo cross build
+        if: matrix.use-cross
+        run: cross build --release --locked --target ${{ matrix.target }}

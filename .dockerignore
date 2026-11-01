@@ -1,0 +1,11 @@
+target/
+.git/
+.github/
+.claude/
+.pi/
+.idea/
+scripts/
+speckit/
+tests/
+*.md
+config.example.yaml
