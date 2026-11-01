@@ -1,0 +1,19 @@
+# Rust build output
+/target/
+/reference/
+/bin/
+/llm-gateway
+/llm-gateway.exe
+
+# Local configuration contains real credentials
+/config.yaml
+/config.local.yaml
+/config.local.yml
+
+# Editor and OS files
+.idea/
+.DS_Store
+Thumbs.db
+
+# Go artifacts from the pre-rewrite tree (kept out of the orphan branch)
+/vendor/
