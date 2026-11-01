@@ -106,9 +106,14 @@ combines several Go table rows into one parameterized test).
    future, so a panic ends the connection task without a finalized record.
    Malformed input must never panic (the config and proxy paths avoid
    `unwrap` on user data).
-3. **Idle timeout.** Go's `IdleTimeout` (90 s) is not implemented; a
-   connection with no requests stays open. Read-header (10 s), keep-alive,
-   connect (10 s) and response-header (30 s) timeouts are implemented.
+3. **Idle / header-read timeout.** Go separates this into `IdleTimeout`
+   (90 s, waiting between keep-alive requests) and `ReadHeaderTimeout`
+   (10 s, reading an in-progress request's headers). Hyper's single
+   `header_read_timeout` covers both: an idle keep-alive connection with no
+   new request, *or* a client that stalls mid-header, is closed after 30 s.
+   This is shorter than Go's idle window but longer than Go's header-read
+   window; connect (10 s) and response-header (30 s) timeouts are separate
+   and unchanged.
 4. **Default `User-Agent`.** Go's `http.Transport` adds
    `User-Agent: Go-http-client/1.1` when the caller omits one. This rewrite
    sends no `User-Agent` in that case. A caller-supplied `User-Agent` is

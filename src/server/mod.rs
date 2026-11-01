@@ -87,7 +87,7 @@ pub(crate) async fn serve_connection<S>(
     let mut connection = Box::pin(
         hyper::server::conn::http1::Builder::new()
             .timer(TokioTimer::new())
-            .header_read_timeout(Duration::from_secs(10))
+            .header_read_timeout(Duration::from_secs(30))
             .keep_alive(true)
             .serve_connection(TokioIo::new(stream), service),
     );
