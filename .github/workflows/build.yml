@@ -86,6 +86,7 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
+          prefix-key: ${{ matrix.use-cross && 'rust-cross-main-v1' || 'rust' }}
           key: ${{ matrix.target }}
 
       - name: Install musl tools

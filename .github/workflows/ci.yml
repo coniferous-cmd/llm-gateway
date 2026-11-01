@@ -66,6 +66,9 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ${{ matrix.use-cross && 'rust-cross-main-v1' || 'rust' }}
+          key: ${{ matrix.target }}
       - name: Install musl tools
         if: matrix.target == 'x86_64-unknown-linux-musl' && !matrix.use-cross
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools

@@ -1,0 +1,12 @@
+# cross 0.2.5's default images have a glibc too old to run build scripts
+# produced by the CI Rust toolchain. Use the maintained Ubuntu 24.04 images.
+# These images run host build scripts; the target toolchains still provide
+# the GNU or musl sysroots needed for each output architecture.
+[target.aarch64-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:main"
+
+[target.aarch64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-musl:main"
+
+[target.armv7-unknown-linux-musleabihf]
+image = "ghcr.io/cross-rs/armv7-unknown-linux-musleabihf:main"
