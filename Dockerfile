@@ -1,35 +1,40 @@
 # syntax=docker/dockerfile:1
 
 # --- Build stage ---
-FROM golang:1.26-alpine AS build
+FROM rust:1.96-bookworm AS build
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends musl-tools \
+    && rm -rf /var/lib/apt/lists/* \
+    && rustup target add x86_64-unknown-linux-musl
 WORKDIR /src
 
-# Cache module downloads separately from source changes.
-COPY go.mod go.sum ./
-RUN go mod download
+# Cache dependency downloads separately from source changes.
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir -p src && echo 'fn main() {}' > src/main.rs \
+    && cargo build --release --locked --target x86_64-unknown-linux-musl || true \
+    && rm -rf src
 
-COPY cmd ./cmd
-COPY internal ./internal
-
-# Pure Go release build, same flags as `make build` plus stripped symbols.
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" \
-    -o /out/llm-gateway ./cmd/llm-gateway
+COPY build.rs ./
+COPY src ./src
+# Static musl build: no shared libc, so the binary runs on any Linux.
+RUN cargo build --release --locked --target x86_64-unknown-linux-musl \
+    && install -D -m 0755 target/x86_64-unknown-linux-musl/release/llm-gateway /out/llm-gateway
 
 # --- Runtime stage ---
-FROM alpine:3.22
-# ca-certificates are required for HTTPS calls to upstream providers.
-RUN apk add --no-cache ca-certificates \
-    && adduser -D -H -u 65532 gateway
-
+# Distroless/static ships ca-certificates (required for HTTPS to upstream
+# providers) and runs as a non-root user.
+FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/llm-gateway /usr/local/bin/llm-gateway
-
-USER gateway
-ENV HOME=/home/gateway
 
 # Mount your config here; it must set `listen: 0.0.0.0:8080` to accept
 # connections from outside the container.
 VOLUME /etc/llm-gateway
 EXPOSE 8080
 
+# The default config/pid/log paths resolve under $HOME, so give the process a
+# writable one inside its own layer.
+ENV HOME=/home/gateway
+USER nonroot:nonroot
+
 ENTRYPOINT ["/usr/local/bin/llm-gateway"]
-CMD ["--config", "/etc/llm-gateway/config.yaml"]
+CMD ["serve", "--config", "/etc/llm-gateway/config.yaml"]

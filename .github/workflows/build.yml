@@ -13,72 +13,125 @@ concurrency:
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 env:
-  CGO_ENABLED: '0'
+  CARGO_TERM_COLOR: never
 
 jobs:
   test:
-    name: Test and vet
+    name: Test and lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      - uses: dtolnay/rust-toolchain@1.96.0
         with:
-          go-version-file: go.mod
-          cache: true
-      - run: go test ./...
-      - run: go vet ./...
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked --all-targets
 
+  # Rust cannot cross-compile Windows/macOS from Linux the way Go can, so each
+  # target builds on a native runner (or, for the cross-only Linux targets,
+  # through `cross` on a Linux runner).
   build:
-    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    name: Build ${{ matrix.name }}
     needs: test
-    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        goos: [linux, windows, darwin]
-        goarch: [amd64, arm64]
         include:
-          # 32-bit ARM (Raspberry Pi and similar); no windows/darwin/arm target.
-          - goos: linux
-            goarch: arm
-    env:
-      GOOS: ${{ matrix.goos }}
-      GOARCH: ${{ matrix.goarch }}
+          - name: linux-amd64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - name: linux-amd64-musl
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive: tar.gz
+            extra: musl
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+          - name: linux-arm64-musl
+            runner: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            archive: tar.gz
+            use-cross: true
+          - name: linux-arm
+            runner: ubuntu-latest
+            target: armv7-unknown-linux-musleabihf
+            archive: tar.gz
+            use-cross: true
+          - name: darwin-amd64
+            runner: macos-13
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - name: darwin-arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - name: windows-amd64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+          - name: windows-arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            archive: zip
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      - uses: dtolnay/rust-toolchain@1.96.0
         with:
-          go-version-file: go.mod
-          cache: true
-      - name: Build and package
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: matrix.extra == 'musl'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Install cross
+        if: matrix.use-cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build
+        if: ${{ !matrix.use-cross }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.use-cross
+        run: cross build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
         id: package
         shell: bash
         run: |
           set -euo pipefail
-          name="llm-gateway-${GOOS}-${GOARCH}"
-          binary=llm-gateway
-          if [[ "$GOOS" == windows ]]; then
-            binary="${binary}.exe"
-          fi
-          version="${GITHUB_REF_NAME}"
-          if [[ "$GITHUB_REF_TYPE" != "tag" ]]; then
-            version="$(git describe --tags --always)"
-          fi
+          name="llm-gateway-${{ matrix.target }}"
           mkdir -p "dist/$name"
-          go build -trimpath -ldflags="-s -w -X main.version=${version}" -o "dist/$name/$binary" ./cmd/llm-gateway
-          cp config.example.yaml "dist/$name/"
-          if [[ "$GOOS" == windows ]]; then
-            archive="${name}.zip"
-            (cd dist && zip -r "$archive" "$name")
+          bin="target/${{ matrix.target }}/release/llm-gateway"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            bin="${bin}.exe"
+            cp "$bin" "dist/$name/llm-gateway.exe"
           else
-            archive="${name}.tar.gz"
-            tar -czf "dist/$archive" -C dist "$name"
+            cp "$bin" "dist/$name/llm-gateway"
           fi
-          echo "archive=dist/$archive" >> "$GITHUB_OUTPUT"
+          cp config.example.yaml "dist/$name/"
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            (cd dist && zip -rq "$name.zip" "$name")
+          else
+            tar -czf "dist/$name.tar.gz" -C dist "$name"
+          fi
+          echo "archive=dist/$name.${{ matrix.archive }}" >> "$GITHUB_OUTPUT"
+
       - name: Upload binary archive
         uses: actions/upload-artifact@v5
         with:
-          name: llm-gateway-${{ matrix.goos }}-${{ matrix.goarch }}
+          name: llm-gateway-${{ matrix.name }}
           path: ${{ steps.package.outputs.archive }}
           if-no-files-found: error
 

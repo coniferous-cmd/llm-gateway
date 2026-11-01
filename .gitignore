@@ -1,10 +1,9 @@
-# Build output and Go test artifacts
+# Rust build output
+/target/
+/reference/
 /bin/
 /llm-gateway
 /llm-gateway.exe
-*.test
-*.test.exe
-coverage.out
 
 # Local configuration contains real credentials
 /config.yaml
@@ -15,4 +14,6 @@ coverage.out
 .idea/
 .DS_Store
 Thumbs.db
+
+# Go artifacts from the pre-rewrite tree (kept out of the orphan branch)
 /vendor/

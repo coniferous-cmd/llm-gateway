@@ -1,21 +1,18 @@
-# GNU Make. Requires Go; no Unix-specific commands are used in recipes.
-# Override tools/paths: make build GO=/path/to/go CONFIG=./config.yaml
+# GNU Make. Recipes avoid Unix-only commands so they run under POSIX sh,
+# bash and Windows shells alike.
+# Override tools/paths: make build CARGO=/path/to/cargo CONFIG=./config.yaml
 .DEFAULT_GOAL := help
 
-GO ?= go
+CARGO ?= cargo
 # Empty CONFIG lets the binary use its default ~/.config/llm-gateway/config.yaml.
 CONFIG ?=
 BIN_DIR ?= bin
-HOST_OS := $(shell $(GO) env GOOS)
-EXE := $(if $(filter windows,$(HOST_OS)),.exe,)
-BINARY := $(BIN_DIR)/llm-gateway$(EXE)
+HOST_OS := $(shell rustc -vV 2>/dev/null | sed -n 's/^host: \(.*-unknown-.*\).*//p')
+BINARY := $(BIN_DIR)/llm-gateway
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-LDFLAGS := -s -w -X main.version=$(VERSION)
+export LLM_GATEWAY_VERSION := $(VERSION)
 
-# Release builds are pure Go and need no C compiler or shared Go runtime.
-export CGO_ENABLED := 0
-
-.PHONY: help build run daemon stop test test-race vet fmt check build-all
+.PHONY: help build run daemon stop test test-release clippy fmt check build-all
 
 # Quotes keep ; ( ) in the help text from being parsed by the recipe shell.
 help:
@@ -23,58 +20,47 @@ help:
 	@echo "make run         - Build and run; CONFIG=./config.yaml optional"
 	@echo "make daemon      - Build and run detached in the background; CONFIG optional"
 	@echo "make stop        - Stop the background gateway"
-	@echo "make test        - Run unit tests"
-	@echo "make test-race   - Run race tests; requires a native C compiler"
-	@echo "make vet         - Run go vet"
-	@echo "make fmt         - Format Go source"
-	@echo "make check       - Run tests and vet"
-	@echo "make build-all   - Build Windows, Linux and macOS for amd64 and arm64, plus Linux arm"
+	@echo "make test        - Run all unit and integration tests"
+	@echo "make test-release - Run the tests in release mode"
+	@echo "make clippy      - Run clippy with warnings denied"
+	@echo "make fmt         - Format Rust source"
+	@echo "make check       - Run tests, clippy and a fmt check"
+	@echo "make build-all   - Cross-build every release target"
 	@echo "Override config: make run CONFIG=./config.example.yaml"
 	@echo "Override version: make build VERSION=v1.2.3 (default: git describe)"
 
 build:
-	$(GO) build -trimpath -ldflags="$(LDFLAGS)" -o "$(BINARY)" ./cmd/llm-gateway
+	$(CARGO) build --release
+	@mkdir -p $(BIN_DIR)
+	@cp target/release/llm-gateway$(if $(findstring windows,$(HOST_OS)),.exe,) "$(BINARY)"
 
 run: build
 	"./$(BINARY)" $(if $(CONFIG),--config "$(CONFIG)")
 
 daemon: build
-	"./$(BINARY)" --daemon $(if $(CONFIG),--config "$(CONFIG)")
+	"./$(BINARY)" serve --daemon $(if $(CONFIG),--config "$(CONFIG)")
 
 stop:
-	"./$(BINARY)" --stop
+	"./$(BINARY)" stop
 
 test:
-	$(GO) test ./...
+	$(CARGO) test --all-targets
 
-# Race instrumentation requires CGO only at test/build time, not in releases.
-test-race: export CGO_ENABLED := 1
-test-race:
-	$(GO) test -race ./...
+test-release:
+	$(CARGO) test --all-targets --release
 
-vet:
-	$(GO) vet ./...
+clippy:
+	$(CARGO) clippy --all-targets -- -D warnings
 
 fmt:
-	$(GO) fmt ./...
+	$(CARGO) fmt
 
-check: test vet
+check: test clippy
+	$(CARGO) fmt --check
 
-# Target-specific environment variables work with both Windows and POSIX shells.
-# go build creates the output directory, so mkdir is not needed.
-define platform
-.PHONY: build-$(1)-$(2)
-build-all: build-$(1)-$(2)
-build-$(1)-$(2): export GOOS := $(1)
-build-$(1)-$(2): export GOARCH := $(2)
-build-$(1)-$(2):
-	$$(GO) build -trimpath -ldflags="$$(LDFLAGS)" -o "$$(BIN_DIR)/llm-gateway-$(1)-$(2)$(3)" ./cmd/llm-gateway
-endef
-
-$(eval $(call platform,windows,amd64,.exe))
-$(eval $(call platform,windows,arm64,.exe))
-$(eval $(call platform,linux,amd64,))
-$(eval $(call platform,linux,arm64,))
-$(eval $(call platform,linux,arm,))
-$(eval $(call platform,darwin,amd64,))
-$(eval $(call platform,darwin,arm64,))
+# Cross-compiling every release target needs `cross` for the non-native
+# ones (Linux musl and Windows); macOS targets build on a macOS runner.
+build-all:
+	$(CARGO) build --release --target aarch64-apple-darwin
+	$(CARGO) build --release --target x86_64-apple-darwin
+	@echo "Cross targets (linux musl, windows) are built by CI; see .github/workflows/build.yml"

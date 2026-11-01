@@ -2,7 +2,7 @@
 
 A lightweight, locally running LLM gateway: callers only store virtual keys; the gateway picks the upstream, swaps `Authorization`, and optionally [rewrites path prefixes](#path-rewriting) per target. It does not convert protocols, count tokens, retry, fail over, or hot-reload configuration. Request bodies pass through untouched, with one optional exception: [model routing](#model-routing) reads — and possibly rewrites — the top-level `model` field of JSON request bodies.
 
-Supports Windows, Linux, macOS (amd64 / arm64). The release is a single binary with no dependency on Go, Node.js, Python, or a C compiler; the config file is supplied separately. The third-party Go dependencies are `gopkg.in/yaml.v3` (config parsing) and `github.com/flynn/noise` (the Noise protocol, used only for the optional gateway-to-gateway encrypted channel).
+Supports Windows, Linux, macOS (amd64 / arm64, plus Linux arm). The release is a single self-contained binary with no dependency on a language runtime or a C compiler; the config file is supplied separately. TLS uses `rustls`, which reads the OS trust store and falls back to a bundled root set when none is available. The e2ee encrypted channel uses the Noise protocol; the rest is plain HTTP.
 
 ## Download
 
@@ -10,28 +10,21 @@ Prebuilt binaries for Windows, Linux and macOS (amd64 / arm64, plus Linux arm) a
 
 ## Install and build
 
-Building from source requires **Go 1.26.4 or newer**. GNU Make is optional; running and building the release binary does not require a C compiler.
+Building from source requires **Rust 1.95 or newer** (the CI toolchain is pinned in `.github/workflows/`). Dependencies are pulled from crates.io and pinned by `Cargo.lock`; GNU Make is optional.
 
 ```sh
-go mod download
-go build -trimpath -o bin/llm-gateway ./cmd/llm-gateway
+cargo build --release --locked
 ```
 
-Windows PowerShell:
+The binary is written to `target/release/llm-gateway` (`.exe` on Windows). `Cargo.lock` is committed, so `--locked` reproduces the same dependency versions.
 
-```powershell
-$env:CGO_ENABLED = '0'
-go mod download
-go build -trimpath -o bin/llm-gateway.exe ./cmd/llm-gateway
-```
-
-To explicitly disable CGO on Linux / macOS:
+To install it into `bin/`:
 
 ```sh
-CGO_ENABLED=0 go build -trimpath -o bin/llm-gateway ./cmd/llm-gateway
+make build
 ```
 
-With GNU Make, `make build` disables CGO by default and builds the native binary.
+`make build` also copies the binary to `bin/llm-gateway`. Cross-compiling every release target is done by CI on native runners — see `.github/workflows/build.yml`.
 
 ## Configuration
 
@@ -388,7 +381,7 @@ Streaming chunks are forwarded immediately; bounded capture stays in memory, and
 
 ## Python request test scripts
 
-The two scripts use the official `openai` and `anthropic` Python SDKs, print the HTTP status, response headers, and body, and exit with code 1 on non-2xx. SDK auto-retries are disabled, and system proxy settings are ignored so the scripts connect directly to the gateway. Dependencies are installed into the development `agents` environment and do not affect the Go gateway's runtime dependencies:
+The two scripts use the official `openai` and `anthropic` Python SDKs, print the HTTP status, response headers, and body, and exit with code 1 on non-2xx. SDK auto-retries are disabled, and system proxy settings are ignored so the scripts connect directly to the gateway. Dependencies are installed into the development `agents` environment and do not affect the gateway's runtime dependencies:
 
 ```sh
 mamba run -n agents python -m pip install openai anthropic
@@ -408,39 +401,25 @@ Both scripts use the Bearer authentication the gateway supports. `test_anthropic
 ## Development and cross-platform verification
 
 ```sh
-go test ./...
-go vet ./...
-go test -race ./...
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
 ```
 
-Regular tests need no C compiler. **Race detection is a development-time requirement**: it needs `CGO_ENABLED=1` on a supported platform with a compatible native C toolchain; release builds may still use `CGO_ENABLED=0`. If MinGW-w64 / GCC or a comparable toolchain is missing on Windows, run the regular tests — but do not treat that as completing race verification.
+Tests need no C compiler and no extra toolchain beyond the Rust toolchain and `rustup`. Rust's ownership and `Send`/`Sync` checks replace a separate race detector: shared mutable state is either a `Mutex` or an atomic, and the compiler rejects data races at compile time.
 
-`cmd/llm-gateway/main_test.go` compiles the real program, creates a temp config and two mock upstreams, and verifies `--config`, 401, round-robin, non-`/v1` paths, and SSE via `curl`. This test needs curl on PATH; it skips when curl is missing. Run it alone with:
-
-```sh
-go test -count=1 -v ./cmd/llm-gateway
-```
+The test suite covers the whole pipeline in process: config parsing and validation, key routing, model routing, path rewriting, the forwarding layer, the conversation store, the Noise handshake and session, the CLI flag matrix, and end-to-end HTTP / e2ee chains against a real loopback upstream. Some tests bind ephemeral loopback ports; they skip with a message where local binding is unavailable.
 
 With GNU Make:
 
 ```sh
 make help
+make test
+make check
+make clippy
+make fmt
 make daemon
 make stop
-make check
-make test-race
-make build-all
-make build-linux-amd64
-make build-windows-arm64
-make build-darwin-arm64
 ```
 
-`make build-all` produces Windows, Linux, and macOS executables for amd64 / arm64 under `bin/`. A successful cross-compile does not prove the binary runs on that OS; CI runs native tests on all three OS families and runs race detection on Linux.
-
-Cross-compiling without Make also works, e.g. in a POSIX shell:
-
-```sh
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o bin/llm-gateway-linux-amd64 ./cmd/llm-gateway
-```
-
-Confirm the CGO-free Linux build is `statically linked` with `file bin/llm-gateway-linux-amd64`. Windows and macOS builds still use the OS-provided interfaces and need no extra language runtime installed.
+`make check` runs tests, clippy and a format check. Cross-compiling every release target is done by CI on native runners (see `.github/workflows/build.yml`); a successful cross-compile does not prove the binary runs on that OS, so CI runs native tests on all three OS families.
