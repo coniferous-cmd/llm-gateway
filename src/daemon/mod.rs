@@ -48,8 +48,7 @@ pub fn start(exe: &Path, args: &[String], log_path: &Path) -> io::Result<Child> 
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log));
-    platform::detach(&mut command);
-    command.spawn()
+    platform::spawn(&mut command)
 }
 
 pub fn write_pid(path: &Path, pid: u32) -> io::Result<()> {

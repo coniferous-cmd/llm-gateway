@@ -1,10 +1,10 @@
 use std::io;
 use std::os::unix::process::CommandExt;
-use std::process::Command;
+use std::process::{Child, Command};
 
 /// Put the child in its own session so terminal signals and closure never
 /// reach it.
-pub fn detach(command: &mut Command) {
+pub fn spawn(command: &mut Command) -> io::Result<Child> {
     // SAFETY: setsid is async-signal-safe and the child has not run any Rust
     // code between fork and exec in this closure.
     unsafe {
@@ -15,6 +15,7 @@ pub fn detach(command: &mut Command) {
             Ok(())
         });
     }
+    command.spawn()
 }
 
 pub fn alive(pid: u32) -> bool {

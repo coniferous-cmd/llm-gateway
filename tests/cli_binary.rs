@@ -1,14 +1,69 @@
 //! Binary-level CLI behavior: exit codes, output routing, and daemon lifecycle.
 
+use std::io::{self, Read};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Duration;
+use std::process::{Command, Output, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_llm-gateway");
 
-fn run(args: &[&str]) -> std::process::Output {
-    Command::new(BIN).args(args).output().unwrap()
+fn run(args: &[&str]) -> Output {
+    try_run(args).unwrap_or_else(|error| panic!("command {args:?}: {error}"))
+}
+
+fn try_run(args: &[&str]) -> io::Result<Output> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut child = Command::new(BIN)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    // Drain both pipes concurrently so verbose output cannot block the child.
+    // Bound EOF waits too: an exited launcher can leave pipe handles inherited
+    // by its daemon, which would make wait_with_output hang indefinitely.
+    let stdout = read_pipe(child.stdout.take().unwrap());
+    let stderr = read_pipe(child.stderr.take().unwrap());
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "process did not exit",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let collect = |pipe: mpsc::Receiver<io::Result<Vec<u8>>>| {
+        pipe.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("output did not reach EOF after process exit: {error}"),
+                )
+            })?
+    };
+    Ok(Output {
+        status,
+        stdout: collect(stdout)?,
+        stderr: collect(stderr)?,
+    })
+}
+
+fn read_pipe(mut pipe: impl Read + Send + 'static) -> mpsc::Receiver<io::Result<Vec<u8>>> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = pipe.read_to_end(&mut bytes).map(|_| bytes);
+        let _ = sender.send(result);
+    });
+    receiver
 }
 
 fn config(path: &Path, listen: &str) {
@@ -110,8 +165,13 @@ fn stop_without_a_pid_file_reports_json_on_stdout() {
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("stop failed"), "{stdout}");
-    assert!(stdout.contains(&pid_text), "{stdout}");
+    let event: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("invalid JSON: {error}: {stdout}"));
+    assert_eq!(event["level"], "ERROR", "{stdout}");
+    assert_eq!(event["msg"], "command failed", "{stdout}");
+    let error = event["error"].as_str().expect("error must be a string");
+    assert!(error.contains("stop failed"), "{stdout}");
+    assert!(error.contains(&pid_text), "{stdout}");
 }
 
 struct DaemonGuard {
@@ -120,9 +180,7 @@ struct DaemonGuard {
 
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
-        let _ = Command::new(BIN)
-            .args(["stop", "--pid-file", &self.pid_path.display().to_string()])
-            .output();
+        let _ = try_run(&["stop", "--pid-file", &self.pid_path.display().to_string()]);
     }
 }
 
