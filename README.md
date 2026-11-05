@@ -408,7 +408,7 @@ cargo fmt --check
 
 Tests need no C compiler and no extra toolchain beyond the Rust toolchain and `rustup`. Rust's ownership and `Send`/`Sync` checks replace a separate race detector: shared mutable state is either a `Mutex` or an atomic, and the compiler rejects data races at compile time.
 
-The test suite covers the whole pipeline in process: config parsing and validation, key routing, model routing, path rewriting, the forwarding layer, the conversation store, the Noise handshake and session, the CLI flag matrix, and end-to-end HTTP / e2ee chains against a real loopback upstream. Some tests bind ephemeral loopback ports; they skip with a message where local binding is unavailable.
+The test suite covers the whole pipeline in process: config parsing and validation, key routing, model routing, path rewriting, the forwarding layer, the conversation store, the Noise handshake and session, the CLI flag matrix, and end-to-end HTTP / e2ee chains against a real loopback upstream. The HTTP tests also exercise the Anthropic Messages shape end to end — `/anthropic` prefix rewriting to `/v1/messages`, `anthropic-version` / `x-api-key` pass-through, the full `message_start`…`message_stop` SSE sequence (including a frame split across two upstream writes), and verbatim relay of an Anthropic error body — since the gateway treats Anthropic as one more transparent protocol, not a special case. Some tests bind ephemeral loopback ports; they skip with a message where local binding is unavailable.
 
 With GNU Make:
 

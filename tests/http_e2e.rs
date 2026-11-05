@@ -191,6 +191,160 @@ async fn start_sse_upstream(
     }
 }
 
+/// An upstream that always answers with the same status, content type and body.
+async fn start_static_upstream(
+    status: StatusCode,
+    content_type: &'static str,
+    body: &'static [u8],
+) -> Upstream {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let (shutdown, mut shutdown_rx) = watch::channel(false);
+    let service_records = records.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => break,
+                accepted = listener.accept() => {
+                    let Ok((stream, _)) = accepted else { continue };
+                    let records = service_records.clone();
+                    tokio::spawn(async move {
+                        let service = service_fn(move |request: Request<Incoming>| {
+                            let records = records.clone();
+                            async move {
+                                let (parts, incoming) = request.into_parts();
+                                let received = incoming.collect().await.unwrap().to_bytes();
+                                records.lock().unwrap().push(Recorded {
+                                    method: parts.method,
+                                    uri: parts.uri.to_string(),
+                                    headers: parts.headers,
+                                    body: received,
+                                });
+                                let response = Response::builder()
+                                    .status(status)
+                                    .header(CONTENT_TYPE, content_type)
+                                    .body(
+                                        Full::new(Bytes::from_static(body))
+                                            .map_err(|never: Infallible| match never {})
+                                            .boxed_unsync(),
+                                    )
+                                    .unwrap();
+                                Ok::<_, Infallible>(response)
+                            }
+                        });
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(TokioIo::new(stream), service)
+                            .await;
+                    });
+                }
+            }
+        }
+    });
+    Upstream {
+        address,
+        records,
+        shutdown,
+    }
+}
+
+// One realistic Anthropic Messages SSE turn. The content_block_delta event is
+// deliberately split across two writes to prove the gateway forwards a frame
+// without reassembling or buffering it.
+const ANTHROPIC_MESSAGE_START: &[u8] = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_01\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-real\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n";
+const ANTHROPIC_BLOCK_START: &[u8] = b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n";
+const ANTHROPIC_DELTA_HEAD: &[u8] =
+    b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,";
+const ANTHROPIC_DELTA_TAIL: &[u8] = b"\"delta\":{\"type\":\"text_delta\",\"text\":\"OK\"}}\n\n";
+const ANTHROPIC_BLOCK_STOP: &[u8] =
+    b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n";
+const ANTHROPIC_MESSAGE_DELTA: &[u8] = b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":2}}\n\n";
+const ANTHROPIC_MESSAGE_STOP: &[u8] = b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+
+/// Emits a full Anthropic turn, holding every event after `message_start` until
+/// the test releases it, so a client can prove the first event was not buffered.
+async fn start_anthropic_sse_upstream(
+    first_sent: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
+) -> Upstream {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let (shutdown, mut shutdown_rx) = watch::channel(false);
+    let service_records = records.clone();
+    let first_sent = Arc::new(Mutex::new(Some(first_sent)));
+    let release = Arc::new(Mutex::new(Some(release)));
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => break,
+                accepted = listener.accept() => {
+                    let Ok((stream, _)) = accepted else { continue };
+                    let records = service_records.clone();
+                    let first_sent = first_sent.clone();
+                    let release = release.clone();
+                    tokio::spawn(async move {
+                        let service = service_fn(move |request: Request<Incoming>| {
+                            let records = records.clone();
+                            let first_sent = first_sent.lock().unwrap().take();
+                            let release = release.lock().unwrap().take();
+                            async move {
+                                let (parts, body) = request.into_parts();
+                                let body = body.collect().await.unwrap().to_bytes();
+                                records.lock().unwrap().push(Recorded {
+                                    method: parts.method,
+                                    uri: parts.uri.to_string(),
+                                    headers: parts.headers,
+                                    body,
+                                });
+                                let (sender, receiver) = tokio::sync::mpsc::channel::<Bytes>(8);
+                                tokio::spawn(async move {
+                                    let _ = sender.send(Bytes::from_static(ANTHROPIC_MESSAGE_START)).await;
+                                    if let Some(first_sent) = first_sent {
+                                        let _ = first_sent.send(());
+                                    }
+                                    if let Some(release) = release {
+                                        let _ = release.await;
+                                    }
+                                    for chunk in [
+                                        ANTHROPIC_BLOCK_START,
+                                        ANTHROPIC_DELTA_HEAD,
+                                        ANTHROPIC_DELTA_TAIL,
+                                        ANTHROPIC_BLOCK_STOP,
+                                        ANTHROPIC_MESSAGE_DELTA,
+                                        ANTHROPIC_MESSAGE_STOP,
+                                    ] {
+                                        let _ = sender.send(Bytes::from_static(chunk)).await;
+                                    }
+                                });
+                                let stream = futures_util::stream::unfold(receiver, |mut receiver| async move {
+                                    receiver.recv().await.map(|chunk| {
+                                        (Ok::<_, BoxError>(Frame::data(chunk)), receiver)
+                                    })
+                                });
+                                let response = Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(CONTENT_TYPE, "text/event-stream")
+                                    .body(StreamBody::new(stream).boxed_unsync())
+                                    .unwrap();
+                                Ok::<_, Infallible>(response)
+                            }
+                        });
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(TokioIo::new(stream), service)
+                            .await;
+                    });
+                }
+            }
+        }
+    });
+    Upstream {
+        address,
+        records,
+        shutdown,
+    }
+}
+
 struct Gateway {
     address: SocketAddr,
     shutdown: watch::Sender<bool>,
@@ -494,6 +648,260 @@ async fn sse_first_chunk_arrives_before_upstream_finishes() {
         }
     }
     assert_eq!(rest, b"data: last\n\n");
+    gateway.stop().await;
+}
+
+/// Anthropic clients configure `base_url=.../anthropic` and the SDK appends
+/// `/v1/messages`. The gateway must rewrite that prefix, resolve the alias, and
+/// forward the client's Anthropic-specific headers untouched.
+#[tokio::test]
+async fn anthropic_messages_request_is_routed_without_protocol_changes() {
+    if !loopback_available() {
+        eprintln!("skipping: loopback binding is unavailable in this environment");
+        return;
+    }
+    let upstream = start_echo_upstream().await;
+    let gateway = start_gateway(
+        &upstream,
+        vec![RewriteRule {
+            source: "/anthropic".into(),
+            destination: String::new(),
+        }],
+        vec![Model {
+            id: "alias".into(),
+            name: "claude-real".into(),
+        }],
+        false,
+    )
+    .await;
+    let request_body =
+        br#"{"model":"alias","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}"#;
+    let response = client()
+        .request(request(
+            Method::POST,
+            &format!("{}/anthropic/v1/messages", gateway.url()),
+            "Bearer dev",
+            &[
+                ("content-type", "application/json"),
+                ("anthropic-version", "2023-06-01"),
+                ("x-api-key", "client-side-value"),
+            ],
+            request_body,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let records = upstream.records();
+    assert_eq!(records.len(), 1);
+    let record = &records[0];
+    assert_eq!(record.uri, "/v1/messages");
+    assert_eq!(
+        record.body.as_ref(),
+        &br#"{"model":"claude-real","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}"#
+            [..]
+    );
+    // Anthropic's own protocol headers are application-layer and pass through.
+    assert_eq!(record.headers["anthropic-version"], "2023-06-01");
+    assert_eq!(record.headers["x-api-key"], "client-side-value");
+    assert_eq!(record.headers[AUTHORIZATION], "Bearer real-key");
+    gateway.stop().await;
+}
+
+/// The whole Anthropic event vocabulary must arrive verbatim, in order, with
+/// the first event flushed before the upstream has produced the rest. A frame
+/// split across two upstream writes must not be held back waiting for the
+/// trailing newline pair.
+#[tokio::test]
+async fn anthropic_sse_events_stream_through_unchanged() {
+    if !loopback_available() {
+        eprintln!("skipping: loopback binding is unavailable in this environment");
+        return;
+    }
+    let (first_sent_tx, first_sent_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let upstream = start_anthropic_sse_upstream(first_sent_tx, release_rx).await;
+    let gateway = start_gateway(&upstream, vec![], vec![], false).await;
+    let response = client()
+        .request(request(
+            Method::POST,
+            &format!("{}/v1/messages", gateway.url()),
+            "Bearer dev",
+            &[
+                ("content-type", "application/json"),
+                ("anthropic-version", "2023-06-01"),
+            ],
+            br#"{"model":"claude-real","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[CONTENT_TYPE],
+        "text/event-stream",
+        "streaming content type must be preserved"
+    );
+
+    let mut body = response.into_body();
+    first_sent_rx.await.unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(2), body.frame())
+        .await
+        .expect("message_start should be flushed before the upstream finishes")
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.into_data().unwrap().as_ref(), ANTHROPIC_MESSAGE_START);
+
+    let _ = release_tx.send(());
+    let mut rest = Vec::new();
+    while let Some(frame) = body.frame().await {
+        if let Ok(data) = frame.unwrap().into_data() {
+            rest.extend_from_slice(&data);
+        }
+    }
+    let mut expected = Vec::new();
+    for chunk in [
+        ANTHROPIC_BLOCK_START,
+        ANTHROPIC_DELTA_HEAD,
+        ANTHROPIC_DELTA_TAIL,
+        ANTHROPIC_BLOCK_STOP,
+        ANTHROPIC_MESSAGE_DELTA,
+        ANTHROPIC_MESSAGE_STOP,
+    ] {
+        expected.extend_from_slice(chunk);
+    }
+    assert_eq!(rest, expected, "every event byte must survive the proxy");
+
+    // The alias in the request was not rewritten (id == name is not required to
+    // be equal to pass through; no alias was configured for this model).
+    let records = upstream.records();
+    assert_eq!(records[0].uri, "/v1/messages");
+    assert_eq!(records[0].headers["anthropic-version"], "2023-06-01");
+    gateway.stop().await;
+}
+
+/// Upstream failures keep their status, content type and Anthropic-shaped body.
+#[tokio::test]
+async fn anthropic_error_response_is_relayed_verbatim() {
+    if !loopback_available() {
+        eprintln!("skipping: loopback binding is unavailable in this environment");
+        return;
+    }
+    const ERROR: &[u8] = br#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"},"request_id":"req_01"}"#;
+    let upstream =
+        start_static_upstream(StatusCode::TOO_MANY_REQUESTS, "application/json", ERROR).await;
+    let gateway = start_gateway(&upstream, vec![], vec![], false).await;
+    let response = client()
+        .request(request(
+            Method::POST,
+            &format!("{}/v1/messages", gateway.url()),
+            "Bearer dev",
+            &[("content-type", "application/json")],
+            br#"{"model":"claude-real","max_tokens":8,"messages":[]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
+    assert_eq!(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .as_ref(),
+        ERROR
+    );
+    gateway.stop().await;
+}
+
+/// A non-streaming Anthropic reply keeps its nested `message.model` — the
+/// gateway does not rewrite response payloads.
+#[tokio::test]
+async fn anthropic_message_response_keeps_the_upstream_model_name() {
+    if !loopback_available() {
+        eprintln!("skipping: loopback binding is unavailable in this environment");
+        return;
+    }
+    const REPLY: &[u8] = br#"{"id":"msg_01","type":"message","role":"assistant","model":"claude-real","content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":1}}"#;
+    let upstream = start_static_upstream(StatusCode::OK, "application/json", REPLY).await;
+    let gateway = start_gateway(
+        &upstream,
+        vec![],
+        vec![Model {
+            id: "alias".into(),
+            name: "claude-real".into(),
+        }],
+        false,
+    )
+    .await;
+    let response = client()
+        .request(request(
+            Method::POST,
+            &format!("{}/v1/messages", gateway.url()),
+            "Bearer dev",
+            &[("content-type", "application/json")],
+            br#"{"model":"alias","max_tokens":8,"messages":[]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body.as_ref(), REPLY);
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["model"], "claude-real");
+    // The request was still rewritten to the upstream name.
+    assert_eq!(
+        upstream.records()[0].body.as_ref(),
+        &br#"{"model":"claude-real","max_tokens":8,"messages":[]}"#[..]
+    );
+    gateway.stop().await;
+}
+
+/// `GET /v1/models`-style calls without a body must still reach the provider and
+/// relay its listing as-is.
+#[tokio::test]
+async fn anthropic_model_listing_passes_through_without_a_body() {
+    if !loopback_available() {
+        eprintln!("skipping: loopback binding is unavailable in this environment");
+        return;
+    }
+    const LISTING: &[u8] = br#"{"data":[{"type":"model","id":"claude-real","display_name":"Claude"}],"has_more":false}"#;
+    let upstream = start_static_upstream(StatusCode::OK, "application/json", LISTING).await;
+    let gateway = start_gateway(
+        &upstream,
+        vec![RewriteRule {
+            source: "/anthropic".into(),
+            destination: String::new(),
+        }],
+        vec![],
+        false,
+    )
+    .await;
+    let response = client()
+        .request(request(
+            Method::GET,
+            &format!("{}/anthropic/v1/models", gateway.url()),
+            "Bearer dev",
+            &[("anthropic-version", "2023-06-01")],
+            b"",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .as_ref(),
+        LISTING
+    );
+    let records = upstream.records();
+    assert_eq!(records[0].method, Method::GET);
+    assert_eq!(records[0].uri, "/v1/models");
     gateway.stop().await;
 }
 

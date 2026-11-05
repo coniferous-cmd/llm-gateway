@@ -7,7 +7,7 @@ intentional divergence.
 
 ## Status
 
-- `cargo test --all-targets`: **96 tests, 5 suites, all passing**
+- `cargo test --all-targets`: **100 tests, 5 suites, all passing**
 - `cargo clippy --all-targets -- -D warnings`: clean
 - `cargo fmt --check`: clean
 
@@ -18,14 +18,14 @@ intentional divergence.
 | `internal/config` parsing, validation, anchors, secrets | 17 | `src/config/` (inline `#[cfg(test)]`) | 23 |
 | `internal/keymap` auth, round-robin, models, `[1m]`, expiry | 10 | `src/keymap.rs` | 7 |
 | `internal/proxy` model scanner, splicing, path rewriting | 22 | `src/proxy/{model,rewrite,prepare}.rs` | 13 |
-| `internal/server` pipeline, logging, conversation lifecycle | 23 | `src/server/mod.rs` + `tests/http_e2e.rs` | 4 + 5 |
+| `internal/server` pipeline, logging, conversation lifecycle | 23 | `src/server/mod.rs` + `tests/http_e2e.rs` | 4 + 10 |
 | `internal/e2ee` handshake, framing, session | 16 | `src/e2ee/` + `tests/e2ee_e2e.rs` | 8 + 3 |
 | `internal/daemon` pid file, stop, probe address | 10 | `src/daemon/mod.rs` + `tests/cli_binary.rs` | 4 + 5 |
 | `internal/conversationlog` capture, store, collisions | 7 | `src/conversationlog/` | 9 |
 | `cmd/llm-gateway` CLI flag matrix, routing | 23 | `src/cli/mod.rs` | 9 |
 | Operational JSON logging | — | `src/logging.rs` + assertions in server tests | 2 |
 
-Total: 96 tests covering the same behaviors as the 128 Go tests (Rust
+Total: 100 tests covering the same behaviors as the 128 Go tests (Rust
 combines several Go table rows into one parameterized test).
 
 ## Byte-level contracts verified
@@ -47,6 +47,17 @@ combines several Go table rows into one parameterized test).
   `X-Forwarded-For` added and existing values preserved; no `Accept-Encoding`
   added and no transparent decompression; status/headers/body passed through;
   429 relayed as-is; SSE flushed per chunk; no retry and no failover.
+- **Anthropic Messages over the transparent path** (previously untested):
+  `/anthropic/v1/messages` rewritten to `/v1/messages`; alias resolved and the
+  request `model` replaced while every other body byte survives; the caller's
+  `anthropic-version` and `x-api-key` headers pass through unchanged;
+  `text/event-stream` replies keep `message_start`, `content_block_start`,
+  `content_block_delta`, `content_block_stop`, `message_delta` and
+  `message_stop` byte-for-byte in order, with the first event flushed before
+  the upstream has produced the rest and a frame split across two upstream
+  writes not held back; a 429 error body is relayed verbatim; a non-streaming
+  reply keeps its nested `message.model` (the gateway rewrites requests only);
+  `GET /v1/models` without a body still reaches the provider.
 - **Body inspection**: 32 MiB limit; `Content-Encoding` other than `identity`
   (or empty) passes through uninspected; model-enabled tokens reject larger
   bodies with `413`; legacy tokens replay the buffered prefix plus the rest of
