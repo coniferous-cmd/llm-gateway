@@ -14,7 +14,8 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use http::header::{
-    AUTHORIZATION, CONNECTION, CONTENT_LENGTH, HOST, TE, TRAILER, TRANSFER_ENCODING, UPGRADE,
+    ACCEPT_ENCODING, AUTHORIZATION, CONNECTION, CONTENT_LENGTH, HOST, TE, TRAILER,
+    TRANSFER_ENCODING, UPGRADE,
 };
 use http::{HeaderMap, HeaderName, Method, Request, Response, Uri, Version};
 use http_body_util::BodyExt;
@@ -213,6 +214,7 @@ impl Forwarder {
             .build()?;
 
         let mut headers = headers;
+        filter_accept_encoding(&mut headers);
         let keep_te_trailers = header_contains_token(&headers, TE, "trailers");
         remove_hop_by_hop(&mut headers);
         if keep_te_trailers {
@@ -259,6 +261,68 @@ fn split_origin(base_url: &str) -> Result<(&str, &str), BoxError> {
         return Err("target base_url has no authority".into());
     }
     Ok((scheme, authority))
+}
+
+/// Codings the gateway can decode, in the order it advertises them.
+const SUPPORTED_CODINGS: [&str; 4] = ["gzip", "deflate", "br", "zstd"];
+
+/// Reduce the caller's `Accept-Encoding` to the gateway-supported subset.
+///
+/// The gateway decodes every response before delivering it, so it must never
+/// advertise a coding it cannot decode. An explicit entry overrides `*` for
+/// that coding, and a caller without the header stays without it.
+fn filter_accept_encoding(headers: &mut HeaderMap) {
+    if !headers.contains_key(ACCEPT_ENCODING) {
+        return;
+    }
+    let mut explicit: HashMap<&'static str, bool> = HashMap::new();
+    let mut wildcard: Option<bool> = None;
+    for value in headers.get_all(ACCEPT_ENCODING) {
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        for entry in value.split(',') {
+            let mut parts = entry.split(';');
+            let coding = parts.next().unwrap_or("").trim();
+            if coding.is_empty() {
+                continue;
+            }
+            let acceptable = entry_quality(parts) > 0.0;
+            if coding == "*" {
+                wildcard = Some(acceptable);
+            } else if let Some(supported) = SUPPORTED_CODINGS
+                .iter()
+                .copied()
+                .find(|candidate| coding.eq_ignore_ascii_case(candidate))
+            {
+                explicit.insert(supported, acceptable);
+            }
+        }
+    }
+    let keep: Vec<&str> = SUPPORTED_CODINGS
+        .iter()
+        .copied()
+        .filter(|coding| explicit.get(coding).copied().or(wildcard).unwrap_or(false))
+        .collect();
+    headers.remove(ACCEPT_ENCODING);
+    if !keep.is_empty()
+        && let Ok(value) = http::HeaderValue::from_str(&keep.join(", "))
+    {
+        headers.insert(ACCEPT_ENCODING, value);
+    }
+}
+
+/// The `q` parameter of one `Accept-Encoding` entry, defaulting to 1.
+fn entry_quality<'a>(params: impl Iterator<Item = &'a str>) -> f32 {
+    for param in params {
+        let Some((name, value)) = param.trim().split_once('=') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("q") {
+            return value.trim().parse().unwrap_or(0.0);
+        }
+    }
+    1.0
 }
 
 fn header_contains_token(headers: &HeaderMap, name: HeaderName, token: &str) -> bool {
@@ -329,6 +393,86 @@ mod tests {
         assert!(!headers.contains_key("keep-alive"));
         assert!(!headers.contains_key(TRANSFER_ENCODING));
         assert_eq!(headers.get("x-custom").unwrap(), "keep");
+    }
+
+    fn filtered(values: &[&'static str]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for value in values {
+            headers.append(ACCEPT_ENCODING, HeaderValue::from_static(value));
+        }
+        filter_accept_encoding(&mut headers);
+        headers
+    }
+
+    fn accept_encoding(headers: &HeaderMap) -> Option<String> {
+        headers
+            .get(ACCEPT_ENCODING)
+            .map(|value| value.to_str().unwrap().to_string())
+    }
+
+    #[test]
+    fn accept_encoding_keeps_only_supported_codings_in_fixed_order() {
+        assert_eq!(
+            accept_encoding(&filtered(&["gzip, deflate, br, zstd"])).as_deref(),
+            Some("gzip, deflate, br, zstd")
+        );
+        assert_eq!(
+            accept_encoding(&filtered(&["br", "zstd"])).as_deref(),
+            Some("br, zstd")
+        );
+        assert_eq!(
+            accept_encoding(&filtered(&["GZIP, identity"])).as_deref(),
+            Some("gzip")
+        );
+    }
+
+    #[test]
+    fn accept_encoding_wildcard_expands_to_the_supported_set() {
+        assert_eq!(
+            accept_encoding(&filtered(&["*"])).as_deref(),
+            Some("gzip, deflate, br, zstd")
+        );
+        // An explicit entry overrides the wildcard for that coding.
+        assert_eq!(
+            accept_encoding(&filtered(&["*;q=1, gzip;q=0"])).as_deref(),
+            Some("deflate, br, zstd")
+        );
+        assert_eq!(
+            accept_encoding(&filtered(&["*;q=0, br;q=0.5"])).as_deref(),
+            Some("br")
+        );
+    }
+
+    #[test]
+    fn accept_encoding_honours_quality_values() {
+        assert_eq!(
+            accept_encoding(&filtered(&["gzip;q=0.5, deflate;q=0"])).as_deref(),
+            Some("gzip")
+        );
+        assert_eq!(
+            accept_encoding(&filtered(&["gzip;q=0, deflate;q=0.25, br;q=1"])).as_deref(),
+            Some("deflate, br")
+        );
+    }
+
+    #[test]
+    fn accept_encoding_drops_unsupported_only_and_stays_absent_without_input() {
+        assert_eq!(accept_encoding(&filtered(&["compress, exi"])), None);
+        assert!(filtered(&[]).get(ACCEPT_ENCODING).is_none());
+    }
+
+    #[test]
+    fn accept_encoding_rewrite_leaves_other_headers_alone() {
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("gzip, br"));
+        headers.insert(
+            HeaderName::from_static("x-custom"),
+            HeaderValue::from_static("keep"),
+        );
+        filter_accept_encoding(&mut headers);
+        assert_eq!(accept_encoding(&headers).as_deref(), Some("gzip, br"));
+        assert_eq!(headers.get("x-custom").unwrap(), "keep");
+        assert_eq!(headers.len(), 2);
     }
 
     #[test]

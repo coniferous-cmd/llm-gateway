@@ -44,9 +44,14 @@ combines several Go table rows into one parameterized test).
   `Host` rewritten to the target authority including port; `Authorization`
   replaced or deleted; hop-by-hop headers (including those named by
   `Connection`) removed; `TE: trailers` preserved like Go; no
-  `X-Forwarded-For` added and existing values preserved; no `Accept-Encoding`
-  added and no transparent decompression; status/headers/body passed through;
-  429 relayed as-is; SSE flushed per chunk; no retry and no failover.
+  `X-Forwarded-For` added and existing values preserved; `Accept-Encoding`
+  reduced to the gateway-decodable subset (empty intersection removes it, no
+  header is invented); single supported response codings decoded before
+  delivery with `Content-Encoding`/`Content-Length`/`Content-MD5` removed;
+  unsupported or layered codings answered with `502`; `HEAD` and
+  `204`/`205`/`304` passed through untouched; other status/headers/body passed
+  through; 429 relayed as-is; SSE flushed per chunk, including while decoding;
+  no retry and no failover.
 - **Anthropic Messages over the transparent path** (previously untested):
   `/anthropic/v1/messages` rewritten to `/v1/messages`; alias resolved and the
   request `model` replaced while every other body byte survives; the caller's
@@ -58,11 +63,13 @@ combines several Go table rows into one parameterized test).
   writes not held back; a 429 error body is relayed verbatim; a non-streaming
   reply keeps its nested `message.model` (the gateway rewrites requests only);
   `GET /v1/models` without a body still reaches the provider.
-- **Body inspection**: 32 MiB limit; `Content-Encoding` other than `identity`
-  (or empty) passes through uninspected; model-enabled tokens reject larger
-  bodies with `413`; legacy tokens replay the buffered prefix plus the rest of
-  the stream without rejecting; `Content-Length` removed only when the body
-  was actually replaced.
+- **Body inspection**: 32 MiB limit; request `Content-Encoding` other than
+  `identity` (or empty) passes through uninspected and undecoded; model-enabled
+  tokens reject larger bodies with `413`; legacy tokens replay the buffered
+  prefix plus the rest of the stream without rejecting; `Content-Length`
+  removed only when the body was actually replaced. Response bodies are
+  inspected after decoding, so conversation records hold the client-visible
+  plaintext while `observed_bytes` counts decoded bytes.
 - **Errors**: `401` with no upstream contact; `400` for unknown model;
   `413` for oversize; `502 Bad Gateway\n` for transport failure with the
   standard `text/plain; charset=utf-8` + `nosniff` headers.
@@ -72,8 +79,10 @@ combines several Go table rows into one parameterized test).
   8 collision retries; `schema_version: 1`; field names, order and
   `omitempty` behavior match Go's struct tags (e.g. `upstream` and
   `model_id`/`model_name` omitted when no target was contacted); request
-  captures the **pre-rewrite** body while the provider sees the rewritten one;
-  `truncated`/`complete`/`observed_bytes`/`captured_bytes` semantics match;
+  captures the **pre-rewrite**, undecoded request body while the provider sees
+  the rewritten one; the response capture holds post-decode plaintext and
+  counts decoded bytes; `truncated`/`complete`/`observed_bytes`/
+  `captured_bytes` semantics otherwise match;
   UTF-8 vs base64 encoding selection matches; `response_complete` overridden
   by the same error-category rule; diagnostics carry only a fixed
   `category` and never include paths, raw errors or bodies.
@@ -148,6 +157,15 @@ combines several Go table rows into one parameterized test).
 9. **Windows tests.** Unix-specific daemon tests (SIGTERM-then-SIGKILL, setsid)
    are `cfg(unix)`; the Windows equivalents are compiled and covered by the
    Windows CI runner. Local development on macOS covers the Unix paths.
+10. **Transparent response decompression.** The Go reference passes a
+    content-coded response through unchanged. This rewrite decodes a single
+    supported coding (`gzip`, `deflate`, `br`, `zstd`) before delivery and
+    reduces `Accept-Encoding` upstream to the subset it can decode, so the
+    gateway-to-client leg is always plaintext. `deflate` follows RFC 9110
+    (zlib-wrapped); raw-DEFLATE servers are not guessed. An unsupported or
+    layered coding becomes a `502` instead of an opaque pass-through, and a
+    mid-stream decode failure keeps the delivered prefix but marks the call
+    incomplete with `upstream_decode`.
 
 ## Not done
 

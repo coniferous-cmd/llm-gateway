@@ -24,6 +24,8 @@ const CATEGORIES: &[&str] = &[
     "preparation_failed",
     "upstream_transport",
     "upstream_read",
+    "upstream_encoding",
+    "upstream_decode",
     "client_write",
     "canceled",
     "aborted",

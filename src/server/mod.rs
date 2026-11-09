@@ -12,7 +12,6 @@ use http::header::{AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE
 use http::{HeaderValue, Method, Request, Response, StatusCode};
 use http_body::{Body, Frame};
 use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use percent_encoding::percent_decode_str;
@@ -26,8 +25,13 @@ use crate::config::Model;
 use crate::conversationlog::{Call, Store};
 use crate::keymap::Map;
 use crate::logging::{JsonLogger, fields};
-use crate::proxy::forward::{BoxError as ForwardError, Forwarder};
+use crate::proxy::decode::{self, DecodeError, ReadBody};
+use crate::proxy::forward::{BoxError as ForwardError, Forwarder, box_response};
 use crate::proxy::prepare::{self, PrepareError, ReqBody};
+
+/// Digest of the encoded representation; it no longer describes the decoded
+/// body, so it is dropped with `Content-Encoding`.
+const CONTENT_MD5: http::header::HeaderName = http::header::HeaderName::from_static("content-md5");
 
 pub struct AppState {
     pub keys: Arc<Map>,
@@ -294,13 +298,48 @@ where
     {
         Ok(upstream) => {
             let status = upstream.status().as_u16();
+            let bodyless = is_head || matches!(status, 204 | 205 | 304);
             request_state.set_status(status);
-            request_state.set_expected_response_bytes(expected_response_bytes(
-                is_head,
-                status,
-                upstream.headers(),
-            ));
-            let (parts, body) = upstream.into_parts();
+            let (mut parts, body) = upstream.into_parts();
+            // Bodyless responses carry no bytes to decode, so their headers
+            // pass through even when they name a coding.
+            let coding = if bodyless {
+                None
+            } else {
+                match decode::classify(&parts.headers) {
+                    Ok(coding) => coding,
+                    Err(_) => {
+                        request_state.fail("upstream_encoding");
+                        return Ok(finish_local(
+                            request_state,
+                            StatusCode::BAD_GATEWAY,
+                            "Bad Gateway\n",
+                        ));
+                    }
+                }
+            };
+            let body = match coding {
+                Some(coding) => {
+                    parts.headers.remove(CONTENT_ENCODING);
+                    parts.headers.remove(CONTENT_LENGTH);
+                    parts.headers.remove(CONTENT_MD5);
+                    // The decoded length is unknown; completion comes from EOF.
+                    request_state.set_expected_response_bytes(None);
+                    if body.is_end_stream() {
+                        empty_body()
+                    } else {
+                        ReadBody::new(box_response(body), coding).boxed_unsync()
+                    }
+                }
+                None => {
+                    request_state.set_expected_response_bytes(expected_response_bytes(
+                        is_head,
+                        status,
+                        &parts.headers,
+                    ));
+                    box_response(body)
+                }
+            };
             let body = ObservedBody {
                 inner: body,
                 state: request_state,
@@ -337,6 +376,12 @@ fn expected_response_bytes(is_head: bool, status: u16, headers: &http::HeaderMap
         .get(CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse().ok())
+}
+
+fn empty_body() -> ReqBody {
+    Full::new(Bytes::new())
+        .map_err(|never: Infallible| match never {})
+        .boxed_unsync()
 }
 
 fn error_response(status: StatusCode, text: &str) -> Response<ReqBody> {
@@ -499,7 +544,7 @@ where
 /// Observes response bytes as hyper writes them and finalizes the request when
 /// the stream ends, errors, or is dropped by a disconnected client.
 struct ObservedBody {
-    inner: Incoming,
+    inner: ReqBody,
     state: Arc<RequestState>,
     done: bool,
 }
@@ -527,13 +572,18 @@ impl Body for ObservedBody {
                 Poll::Ready(Some(Ok(frame)))
             }
             Poll::Ready(Some(Err(error))) => {
-                self.state.fail("upstream_read");
+                let category = if error.is::<DecodeError>() {
+                    "upstream_decode"
+                } else {
+                    "upstream_read"
+                };
+                self.state.fail(category);
                 if let Some(call) = &self.state.call {
                     call.response.observe(&[], false, true);
                 }
                 self.state.finish();
                 self.done = true;
-                Poll::Ready(Some(Err(Box::new(error) as ForwardError)))
+                Poll::Ready(Some(Err(error)))
             }
             Poll::Ready(None) => {
                 if let Some(call) = &self.state.call {

@@ -248,6 +248,263 @@ async fn start_static_upstream(
     }
 }
 
+/// How the coding test double decides whether to compress its reply.
+#[derive(Clone, Copy)]
+enum CodingMode {
+    /// Compress with the first supported coding the request advertises.
+    Negotiated,
+    /// Compress with this coding regardless of what was advertised.
+    Force(&'static str),
+    /// Name this coding in the response without compressing the body.
+    Declare(&'static str),
+    /// gzip-compress, then cut the stream short.
+    TruncatedGzip,
+}
+
+async fn encode_body(coding: &str, plain: &[u8]) -> Vec<u8> {
+    use async_compression::tokio::write::{BrotliEncoder, GzipEncoder, ZlibEncoder, ZstdEncoder};
+    use tokio::io::AsyncWriteExt;
+
+    let mut out = Vec::new();
+    match coding {
+        "gzip" => {
+            let mut encoder = GzipEncoder::new(&mut out);
+            encoder.write_all(plain).await.unwrap();
+            encoder.shutdown().await.unwrap();
+        }
+        "deflate" => {
+            let mut encoder = ZlibEncoder::new(&mut out);
+            encoder.write_all(plain).await.unwrap();
+            encoder.shutdown().await.unwrap();
+        }
+        "br" => {
+            let mut encoder = BrotliEncoder::new(&mut out);
+            encoder.write_all(plain).await.unwrap();
+            encoder.shutdown().await.unwrap();
+        }
+        "zstd" => {
+            let mut encoder = ZstdEncoder::new(&mut out);
+            encoder.write_all(plain).await.unwrap();
+            encoder.shutdown().await.unwrap();
+        }
+        other => panic!("unknown coding {other}"),
+    }
+    out
+}
+
+fn negotiated_coding(headers: &HeaderMap) -> Option<&'static str> {
+    let acceptable: Vec<String> = headers
+        .get_all("accept-encoding")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(|token| token.trim().to_ascii_lowercase())
+        .collect();
+    ["gzip", "deflate", "br", "zstd"]
+        .into_iter()
+        .find(|coding| acceptable.iter().any(|token| token == coding))
+}
+
+/// An upstream that compresses according to `mode`, so the gateway's
+/// negotiation and decoding can be observed from the client side.
+async fn start_coding_upstream(
+    mode: CodingMode,
+    status: StatusCode,
+    body: &'static [u8],
+) -> Upstream {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let (shutdown, mut shutdown_rx) = watch::channel(false);
+    let service_records = records.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => break,
+                accepted = listener.accept() => {
+                    let Ok((stream, _)) = accepted else { continue };
+                    let records = service_records.clone();
+                    tokio::spawn(async move {
+                        let service = service_fn(move |request: Request<Incoming>| {
+                            let records = records.clone();
+                            async move {
+                                let (parts, incoming) = request.into_parts();
+                                let received = incoming.collect().await.unwrap().to_bytes();
+                                let declared = match mode {
+                                    CodingMode::Negotiated => negotiated_coding(&parts.headers),
+                                    CodingMode::Force(coding) | CodingMode::Declare(coding) => {
+                                        Some(coding)
+                                    }
+                                    CodingMode::TruncatedGzip => Some("gzip"),
+                                };
+                                records.lock().unwrap().push(Recorded {
+                                    method: parts.method,
+                                    uri: parts.uri.to_string(),
+                                    headers: parts.headers,
+                                    body: received,
+                                });
+                                let bytes = match (mode, declared) {
+                                    (CodingMode::Force(coding), _) => {
+                                        encode_body(coding, body).await
+                                    }
+                                    (CodingMode::TruncatedGzip, _) => {
+                                        let mut encoded = encode_body("gzip", body).await;
+                                        let keep = encoded.len() * 2 / 3;
+                                        encoded.truncate(keep.max(1));
+                                        encoded
+                                    }
+                                    (CodingMode::Negotiated, Some(coding)) => {
+                                        encode_body(coding, body).await
+                                    }
+                                    _ => body.to_vec(),
+                                };
+                                let mut builder = Response::builder()
+                                    .status(status)
+                                    .header(CONTENT_TYPE, "application/json")
+                                    .header("content-length", bytes.len().to_string());
+                                if let Some(coding) = declared {
+                                    builder = builder.header("content-encoding", coding);
+                                }
+                                let response = builder
+                                    .body(
+                                        Full::new(Bytes::from(bytes))
+                                            .map_err(|never: Infallible| match never {})
+                                            .boxed_unsync(),
+                                    )
+                                    .unwrap();
+                                Ok::<_, Infallible>(response)
+                            }
+                        });
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(TokioIo::new(stream), service)
+                            .await;
+                    });
+                }
+            }
+        }
+    });
+    Upstream {
+        address,
+        records,
+        shutdown,
+    }
+}
+
+/// Writes compressed bytes into a channel the response body reads from.
+struct ChannelWriter {
+    sender: tokio::sync::mpsc::UnboundedSender<Bytes>,
+}
+
+impl tokio::io::AsyncWrite for ChannelWriter {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let count = buf.len();
+        match self.sender.send(Bytes::copy_from_slice(buf)) {
+            Ok(()) => std::task::Poll::Ready(Ok(count)),
+            Err(_) => std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into())),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// A gzip-encoded SSE upstream that flushes the first event before producing
+/// the rest, so incremental decoding can be proven.
+async fn start_gzip_sse_upstream(
+    first_sent: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
+) -> Upstream {
+    use async_compression::tokio::write::GzipEncoder;
+    use tokio::io::AsyncWriteExt;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let (shutdown, mut shutdown_rx) = watch::channel(false);
+    let service_records = records.clone();
+    let first_sent = Arc::new(Mutex::new(Some(first_sent)));
+    let release = Arc::new(Mutex::new(Some(release)));
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => break,
+                accepted = listener.accept() => {
+                    let Ok((stream, _)) = accepted else { continue };
+                    let records = service_records.clone();
+                    let first_sent = first_sent.clone();
+                    let release = release.clone();
+                    tokio::spawn(async move {
+                        let service = service_fn(move |request: Request<Incoming>| {
+                            let records = records.clone();
+                            let first_sent = first_sent.lock().unwrap().take();
+                            let release = release.lock().unwrap().take();
+                            async move {
+                                let (parts, incoming) = request.into_parts();
+                                let body = incoming.collect().await.unwrap().to_bytes();
+                                records.lock().unwrap().push(Recorded {
+                                    method: parts.method,
+                                    uri: parts.uri.to_string(),
+                                    headers: parts.headers,
+                                    body,
+                                });
+                                let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+                                tokio::spawn(async move {
+                                    let mut encoder = GzipEncoder::new(ChannelWriter { sender });
+                                    encoder.write_all(b"data: first\n\n").await.unwrap();
+                                    encoder.flush().await.unwrap();
+                                    if let Some(first_sent) = first_sent {
+                                        let _ = first_sent.send(());
+                                    }
+                                    if let Some(release) = release {
+                                        let _ = release.await;
+                                    }
+                                    encoder.write_all(b"data: last\n\n").await.unwrap();
+                                    encoder.shutdown().await.unwrap();
+                                });
+                                let stream = futures_util::stream::unfold(receiver, |mut receiver| async move {
+                                    receiver.recv().await.map(|chunk| {
+                                        (Ok::<_, BoxError>(Frame::data(chunk)), receiver)
+                                    })
+                                });
+                                let response = Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(CONTENT_TYPE, "text/event-stream")
+                                    .header("content-encoding", "gzip")
+                                    .body(StreamBody::new(stream).boxed_unsync())
+                                    .unwrap();
+                                Ok::<_, Infallible>(response)
+                            }
+                        });
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(TokioIo::new(stream), service)
+                            .await;
+                    });
+                }
+            }
+        }
+    });
+    Upstream {
+        address,
+        records,
+        shutdown,
+    }
+}
+
 // One realistic Anthropic Messages SSE turn. The content_block_delta event is
 // deliberately split across two writes to prove the gateway forwards a frame
 // without reassembling or buffering it.
@@ -948,5 +1205,510 @@ async fn conversation_record_contains_request_and_response() {
     let text = std::fs::read_to_string(&files[0]).unwrap();
     assert!(!text.contains("secret=query"));
     assert!(!text.contains("real-key"));
+    gateway.stop().await;
+}
+
+const CODED_PLAIN: &[u8] =
+    br#"{"id":"msg_01","type":"message","content":[{"type":"text","text":"OK"}]}"#;
+
+fn conversation_records(gateway: &Gateway) -> Vec<serde_json::Value> {
+    let root = gateway.directory.path().join("conversations");
+    let mut files = Vec::new();
+    for day in std::fs::read_dir(&root).unwrap() {
+        for file in std::fs::read_dir(day.unwrap().path()).unwrap() {
+            files.push(file.unwrap().path());
+        }
+    }
+    files
+        .iter()
+        .map(|file| serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn compressed_response_is_delivered_as_plaintext() {
+    if !loopback_available() {
+        eprintln!("skipping: loopback binding is unavailable in this environment");
+        return;
+    }
+    let upstream = start_coding_upstream(CodingMode::Negotiated, StatusCode::OK, CODED_PLAIN).await;
+    let gateway = start_gateway(&upstream, vec![], vec![], false).await;
+    let response = client()
+        .request(request(
+            Method::POST,
+            &format!("{}/v1/messages", gateway.url()),
+            "Bearer dev",
+            &[("accept-encoding", "gzip, br")],
+            br#"{"model":"m","messages":[]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.headers().get("content-encoding").is_none(),
+        "decoded response must not name a coding"
+    );
+    assert!(
+        response.headers().get("content-length").is_none(),
+        "decoded response must not carry the encoded length"
+    );
+    assert_eq!(
+        response.into_body().collect().await.unwrap().to_bytes(),
+        CODED_PLAIN
+    );
+    assert_eq!(upstream.records()[0].headers["accept-encoding"], "gzip, br");
+    gateway.stop().await;
+}
+
+#[tokio::test]
+async fn brotli_only_client_gets_plaintext() {
+    if !loopback_available() {
+        eprintln!("skipping: loopback binding is unavailable in this environment");
+        return;
+    }
+    let upstream = start_coding_upstream(CodingMode::Negotiated, StatusCode::OK, CODED_PLAIN).await;
+    let gateway = start_gateway(&upstream, vec![], vec![], false).await;
+    let response = client()
+        .request(request(
+            Method::GET,
+            &format!("{}/v1/models", gateway.url()),
+            "Bearer dev",
+            &[("accept-encoding", "br")],
+            b"",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.into_body().collect().await.unwrap().to_bytes(),
+        CODED_PLAIN
+    );
+    assert_eq!(upstream.records()[0].headers["accept-encoding"], "br");
+    gateway.stop().await;
+}
+
+#[tokio::test]
+async fn unsupported_client_coding_is_not_advertised_upstream() {
+    if !loopback_available() {
+        eprintln!("skipping: loopback binding is unavailable in this environment");
+        return;
+    }
+    let upstream = start_coding_upstream(CodingMode::Negotiated, StatusCode::OK, CODED_PLAIN).await;
+    let gateway = start_gateway(&upstream, vec![], vec![], false).await;
+    let response = client()
+        .request(request(
+            Method::GET,
+            &format!("{}/v1/models", gateway.url()),
+            "Bearer dev",
+            &[("accept-encoding", "compress, exi")],
+            b"",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.into_body().collect().await.unwrap().to_bytes(),
+        CODED_PLAIN
+    );
+    assert!(
+        upstream.records()[0]
+            .headers
+            .get("accept-encoding")
+            .is_none(),
+        "an empty intersection removes the header"
+    );
+    gateway.stop().await;
+}
+
+#[tokio::test]
+async fn missing_accept_encoding_is_not_added_upstream() {
+    if !loopback_available() {
+        eprintln!("skipping: loopback binding is unavailable in this environment");
+        return;
+    }
+    let upstream = start_coding_upstream(CodingMode::Negotiated, StatusCode::OK, CODED_PLAIN).await;
+    let gateway = start_gateway(&upstream, vec![], vec![], false).await;
+    let response = client()
+        .request(request(
+            Method::GET,
+            &format!("{}/v1/models", gateway.url()),
+            "Bearer dev",
+            &[],
+            b"",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        upstream.records()[0]
+            .headers
+            .get("accept-encoding")
+            .is_none(),
+        "the gateway must not invent an Accept-Encoding header"
+    );
+    gateway.stop().await;
+}
+
+#[tokio::test]
+async fn wildcard_and_quality_values_reduce_to_the_supported_set() {
+    if !loopback_available() {
+        eprintln!("skipping: loopback binding is unavailable in this environment");
+        return;
+    }
+    let upstream = start_coding_upstream(CodingMode::Negotiated, StatusCode::OK, CODED_PLAIN).await;
+    let gateway = start_gateway(&upstream, vec![], vec![], false).await;
+
+    let response = client()
+        .request(request(
+            Method::GET,
+            &format!("{}/v1/models", gateway.url()),
+            "Bearer dev",
+            &[("accept-encoding", "*")],
+            b"",
+        ))
+        .await
+        .unwrap();
+    let _ = response.into_body().collect().await.unwrap();
+    assert_eq!(
+        upstream.records()[0].headers["accept-encoding"],
+        "gzip, deflate, br, zstd"
+    );
+
+    let response = client()
+        .request(request(
+            Method::GET,
+            &format!("{}/v1/models", gateway.url()),
+            "Bearer dev",
+            &[("accept-encoding", "gzip;q=0, deflate")],
+            b"",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(upstream.records()[1].headers["accept-encoding"], "deflate");
+    gateway.stop().await;
+}
+
+#[tokio::test]
+async fn gzip_sse_first_event_arrives_before_the_rest() {
+    if !loopback_available() {
+        eprintln!("skipping: loopback binding is unavailable in this environment");
+        return;
+    }
+    let (first_sent_tx, first_sent_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let upstream = start_gzip_sse_upstream(first_sent_tx, release_rx).await;
+    let gateway = start_gateway(&upstream, vec![], vec![], true).await;
+    let response = client()
+        .request(request(
+            Method::POST,
+            &format!("{}/v1/chat/completions", gateway.url()),
+            "Bearer dev",
+            &[("accept-encoding", "gzip")],
+            br#"{"stream":true}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get("content-encoding").is_none());
+    let mut body = response.into_body();
+    first_sent_rx.await.unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(2), body.frame())
+        .await
+        .expect("the decoded first event should be flushed before the upstream finishes")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        first.into_data().unwrap(),
+        Bytes::from_static(b"data: first\n\n")
+    );
+    let _ = release_tx.send(());
+    let mut rest = Vec::new();
+    while let Some(frame) = body.frame().await {
+        if let Ok(data) = frame.unwrap().into_data() {
+            rest.extend_from_slice(&data);
+        }
+    }
+    assert_eq!(rest, b"data: last\n\n");
+    assert_eq!(upstream.records()[0].headers["accept-encoding"], "gzip");
+    let record = &conversation_records(&gateway)[0];
+    assert_eq!(record["response"]["data"], "data: first\n\ndata: last\n\n");
+    assert_eq!(record["response"]["encoding"], "utf-8");
+    assert_eq!(record["response"]["observed_bytes"], 25);
+    assert_eq!(record["response_complete"], true);
+    gateway.stop().await;
+}
+
+#[tokio::test]
+async fn unsupported_response_coding_is_rejected_before_forwarding_bytes() {
+    if !loopback_available() {
+        eprintln!("skipping: loopback binding is unavailable in this environment");
+        return;
+    }
+    let upstream =
+        start_coding_upstream(CodingMode::Declare("compress"), StatusCode::OK, CODED_PLAIN).await;
+    let gateway = start_gateway(&upstream, vec![], vec![], true).await;
+    let response = client()
+        .request(request(
+            Method::GET,
+            &format!("{}/v1/models", gateway.url()),
+            "Bearer dev",
+            &[("accept-encoding", "gzip")],
+            b"",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        response.into_body().collect().await.unwrap().to_bytes(),
+        "Bad Gateway\n"
+    );
+    let record = &conversation_records(&gateway)[0];
+    assert_eq!(record["error"], "upstream_encoding");
+    gateway.stop().await;
+}
+
+#[tokio::test]
+async fn layered_response_coding_is_rejected() {
+    if !loopback_available() {
+        eprintln!("skipping: loopback binding is unavailable in this environment");
+        return;
+    }
+    let upstream =
+        start_coding_upstream(CodingMode::Declare("gzip, br"), StatusCode::OK, CODED_PLAIN).await;
+    let gateway = start_gateway(&upstream, vec![], vec![], false).await;
+    let response = client()
+        .request(request(
+            Method::GET,
+            &format!("{}/v1/models", gateway.url()),
+            "Bearer dev",
+            &[("accept-encoding", "gzip, br")],
+            b"",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    gateway.stop().await;
+}
+
+#[tokio::test]
+async fn bodyless_responses_keep_their_coding_headers() {
+    if !loopback_available() {
+        eprintln!("skipping: loopback binding is unavailable in this environment");
+        return;
+    }
+    let upstream =
+        start_coding_upstream(CodingMode::Force("gzip"), StatusCode::OK, CODED_PLAIN).await;
+    let gateway = start_gateway(&upstream, vec![], vec![], false).await;
+    let response = client()
+        .request(request(
+            Method::HEAD,
+            &format!("{}/v1/models", gateway.url()),
+            "Bearer dev",
+            &[("accept-encoding", "gzip")],
+            b"",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-encoding"], "gzip");
+    assert!(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty()
+    );
+    gateway.stop().await;
+
+    let upstream =
+        start_coding_upstream(CodingMode::Declare("gzip"), StatusCode::NOT_MODIFIED, b"").await;
+    let gateway = start_gateway(&upstream, vec![], vec![], false).await;
+    let response = client()
+        .request(request(
+            Method::GET,
+            &format!("{}/v1/models", gateway.url()),
+            "Bearer dev",
+            &[("accept-encoding", "gzip")],
+            b"",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(response.headers()["content-encoding"], "gzip");
+    assert!(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty()
+    );
+    gateway.stop().await;
+}
+
+#[tokio::test]
+async fn empty_body_with_a_coding_is_delivered_empty() {
+    if !loopback_available() {
+        eprintln!("skipping: loopback binding is unavailable in this environment");
+        return;
+    }
+    let upstream = start_coding_upstream(CodingMode::Declare("gzip"), StatusCode::OK, b"").await;
+    let gateway = start_gateway(&upstream, vec![], vec![], false).await;
+    let response = client()
+        .request(request(
+            Method::GET,
+            &format!("{}/v1/models", gateway.url()),
+            "Bearer dev",
+            &[("accept-encoding", "gzip")],
+            b"",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get("content-encoding").is_none());
+    assert!(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty()
+    );
+    gateway.stop().await;
+}
+
+#[tokio::test]
+async fn conversation_record_contains_decoded_response_and_raw_request() {
+    use base64::Engine as _;
+
+    if !loopback_available() {
+        eprintln!("skipping: loopback binding is unavailable in this environment");
+        return;
+    }
+    let upstream = start_coding_upstream(CodingMode::Negotiated, StatusCode::OK, CODED_PLAIN).await;
+    let gateway = start_gateway(&upstream, vec![], vec![], true).await;
+    let raw_request = br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#;
+    let compressed_request = encode_body("gzip", raw_request).await;
+    let mut forwarded = Request::new(Full::new(Bytes::from(compressed_request.clone())));
+    *forwarded.method_mut() = Method::POST;
+    *forwarded.uri_mut() = format!("{}/v1/messages", gateway.url()).parse().unwrap();
+    forwarded
+        .headers_mut()
+        .insert(AUTHORIZATION, "Bearer dev".parse().unwrap());
+    forwarded
+        .headers_mut()
+        .insert("content-encoding", "gzip".parse().unwrap());
+    forwarded
+        .headers_mut()
+        .insert("accept-encoding", "gzip".parse().unwrap());
+    let response = client().request(forwarded).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get("content-encoding").is_none());
+    assert_eq!(
+        response.into_body().collect().await.unwrap().to_bytes(),
+        CODED_PLAIN
+    );
+
+    let record = &conversation_records(&gateway)[0];
+    assert_eq!(
+        record["response"]["data"],
+        String::from_utf8_lossy(CODED_PLAIN).to_string()
+    );
+    assert_eq!(record["response"]["encoding"], "utf-8");
+    assert_eq!(record["response"]["observed_bytes"], CODED_PLAIN.len());
+    assert_eq!(record["response_complete"], true);
+    // The request body is recorded as it arrived, still compressed.
+    assert_eq!(record["request"]["encoding"], "base64");
+    assert_eq!(
+        record["request"]["observed_bytes"],
+        compressed_request.len()
+    );
+    let captured = base64::engine::general_purpose::STANDARD
+        .decode(record["request"]["data"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(captured, compressed_request);
+    // The upstream saw the compressed request unchanged.
+    assert_eq!(upstream.records()[0].body.as_ref(), &compressed_request[..]);
+    gateway.stop().await;
+}
+
+#[tokio::test]
+async fn binary_decoded_response_is_recorded_as_base64() {
+    use base64::Engine as _;
+
+    if !loopback_available() {
+        eprintln!("skipping: loopback binding is unavailable in this environment");
+        return;
+    }
+    let mut binary: Vec<u8> = (0u8..=255).collect();
+    binary.extend_from_slice(&[0x00, 0xff, 0xfe, 0x80]);
+    let plain: &'static [u8] = Box::leak(binary.into_boxed_slice());
+    let upstream = start_coding_upstream(CodingMode::Force("gzip"), StatusCode::OK, plain).await;
+    let gateway = start_gateway(&upstream, vec![], vec![], true).await;
+    let response = client()
+        .request(request(
+            Method::GET,
+            &format!("{}/v1/models", gateway.url()),
+            "Bearer dev",
+            &[("accept-encoding", "gzip")],
+            b"",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.into_body().collect().await.unwrap().to_bytes(),
+        plain
+    );
+    let record = &conversation_records(&gateway)[0];
+    assert_eq!(record["response"]["encoding"], "base64");
+    assert_eq!(record["response"]["observed_bytes"], plain.len());
+    let captured = base64::engine::general_purpose::STANDARD
+        .decode(record["response"]["data"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(captured, plain.to_vec());
+    gateway.stop().await;
+}
+
+#[tokio::test]
+async fn truncated_gzip_marks_the_record_incomplete() {
+    if !loopback_available() {
+        eprintln!("skipping: loopback binding is unavailable in this environment");
+        return;
+    }
+    let plain: &'static [u8] = Box::leak(
+        format!("{{\"data\":\"{}\"}}", "all work and no play ".repeat(200))
+            .into_bytes()
+            .into_boxed_slice(),
+    );
+    let upstream = start_coding_upstream(CodingMode::TruncatedGzip, StatusCode::OK, plain).await;
+    let gateway = start_gateway(&upstream, vec![], vec![], true).await;
+    // Depending on how early the decoder notices, the client either receives
+    // headers and then a broken body stream, or loses the connection outright.
+    // Both prove the truncated reply is not delivered as complete.
+    if let Ok(response) = client()
+        .request(request(
+            Method::GET,
+            &format!("{}/v1/models", gateway.url()),
+            "Bearer dev",
+            &[("accept-encoding", "gzip")],
+            b"",
+        ))
+        .await
+    {
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.into_body().collect().await.is_err(),
+            "a truncated coded body must not look like a complete reply"
+        );
+    }
+    let record = &conversation_records(&gateway)[0];
+    assert_eq!(record["error"], "upstream_decode");
+    assert_eq!(record["response_complete"], false);
     gateway.stop().await;
 }
