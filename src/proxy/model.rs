@@ -44,6 +44,44 @@ pub fn model_value(body: &[u8]) -> Option<ModelSpan> {
     }
 }
 
+/// Whether the caller asked for a streamed response.
+///
+/// Looks at the first top-level `stream` key and requires a boolean, like
+/// `model_value`. Returns `Some(true)` or `Some(false)` for that boolean,
+/// `Some(false)` when the body is a well-formed JSON object without such a
+/// key (both the OpenAI and Anthropic APIs default to non-streaming), and
+/// `None` when the body is not a complete top-level object, so callers can
+/// omit the field instead of guessing.
+pub fn stream_requested(body: &[u8]) -> Option<bool> {
+    let mut scanner = Scanner { body, index: 0 };
+    scanner.skip_whitespace();
+    scanner.expect(b'{')?;
+    scanner.skip_whitespace();
+    if scanner.peek() == Some(b'}') {
+        return Some(false);
+    }
+    loop {
+        let key = scanner.parse_string()?;
+        scanner.skip_whitespace();
+        scanner.expect(b':')?;
+        scanner.skip_whitespace();
+        if key.0 == "stream" {
+            return match scanner.peek()? {
+                b't' => scanner.literal(b"true").map(|()| true),
+                b'f' => scanner.literal(b"false").map(|()| false),
+                _ => None,
+            };
+        }
+        scanner.skip_value()?;
+        scanner.skip_whitespace();
+        match scanner.next()? {
+            b',' => scanner.skip_whitespace(),
+            b'}' => return Some(false),
+            _ => return None,
+        }
+    }
+}
+
 /// Replace a model literal with `name`, using Go's `encoding/json` escaping so
 /// the result matches the reference implementation byte for byte.
 pub fn splice_model_value(body: &[u8], span: &ModelSpan, name: &str) -> Vec<u8> {
@@ -272,6 +310,28 @@ mod tests {
                 }
                 None => assert!(found.is_none(), "{body:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn stream_requested_table() {
+        let cases: &[(&str, Option<bool>)] = &[
+            (r#"{"model":"x","stream":true}"#, Some(true)),
+            (r#"{"stream" : false }"#, Some(false)),
+            (r#"{"model":"x"}"#, Some(false)),
+            ("{}", Some(false)),
+            (r#"{"stream":true,"stream":false}"#, Some(true)),
+            (r#"{"nested":{"stream":true}}"#, Some(false)),
+            (r#"{"stream":123}"#, None),
+            (r#"{"stream":"true"}"#, None),
+            (r#"{"stream":null}"#, None),
+            (r#"[{"stream":true}]"#, None),
+            (r#""stream""#, None),
+            ("", None),
+            ("not JSON at all", None),
+        ];
+        for (body, want) in cases {
+            assert_eq!(stream_requested(body.as_bytes()), *want, "{body:?}");
         }
     }
 

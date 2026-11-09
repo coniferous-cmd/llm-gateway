@@ -172,6 +172,7 @@ where
             decoded_path,
             String::new(),
             None,
+            None,
             StatusCode::UNAUTHORIZED.as_u16(),
             None,
             None,
@@ -207,6 +208,7 @@ where
             decoded_path,
             String::new(),
             None,
+            None,
             StatusCode::BAD_GATEWAY.as_u16(),
             call.clone(),
             state.recorder.clone(),
@@ -236,6 +238,7 @@ where
                 decoded_path,
                 String::new(),
                 None,
+                None,
                 StatusCode::BAD_REQUEST.as_u16(),
                 call.clone(),
                 state.recorder.clone(),
@@ -255,6 +258,7 @@ where
                 decoded_path,
                 String::new(),
                 None,
+                None,
                 StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
                 call.clone(),
                 state.recorder.clone(),
@@ -271,6 +275,7 @@ where
 
     let is_head = method == Method::HEAD;
     let model = prepared.model.clone();
+    let stream = prepared.stream;
     let target = prepared.target.clone();
     let request_state = RequestState::new(
         started,
@@ -278,6 +283,7 @@ where
         decoded_path,
         target.base_url.clone(),
         model,
+        stream,
         StatusCode::BAD_GATEWAY.as_u16(),
         call.clone(),
         state.recorder.clone(),
@@ -409,6 +415,7 @@ pub struct RequestState {
     path: String,
     target: String,
     model: Option<Model>,
+    stream: Option<bool>,
     status: AtomicU16,
     call: Option<Arc<Call>>,
     recorder: Option<Arc<Store>>,
@@ -425,6 +432,7 @@ impl RequestState {
         path: String,
         target: String,
         model: Option<Model>,
+        stream: Option<bool>,
         status: u16,
         call: Option<Arc<Call>>,
         recorder: Option<Arc<Store>>,
@@ -436,6 +444,7 @@ impl RequestState {
             path,
             target,
             model,
+            stream,
             status: AtomicU16::new(status),
             call,
             recorder,
@@ -488,6 +497,9 @@ impl RequestState {
         );
         if let Some(model) = &self.model {
             event.insert("model".into(), json!({"id": model.id, "name": model.name}));
+        }
+        if let Some(stream) = self.stream {
+            event.insert("stream".into(), json!(stream));
         }
         if let Some(call) = &self.call {
             event.insert("request_id".into(), json!(call.id()));
@@ -737,6 +749,34 @@ mod tests {
         *request.body_mut() = Full::new(Bytes::from(huge));
         let response = handle(state, request).await.unwrap();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn request_log_reports_the_stream_flag() {
+        let temp = tempdir().unwrap();
+        let state = state(temp.path(), vec![entry(&[("known", "real")])]);
+        let streamed = request(
+            Method::POST,
+            "/v1/chat",
+            "Bearer dev",
+            br#"{"model":"known","stream":true}"#,
+        );
+        let response = handle(state.clone(), streamed).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        let plain = request(
+            Method::POST,
+            "/v1/chat",
+            "Bearer dev",
+            br#"{"model":"known"}"#,
+        );
+        let response = handle(state, plain).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        let lines = log_lines(temp.path()).await;
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["stream"], true);
+        assert_eq!(lines[1]["stream"], false);
     }
 
     #[tokio::test]

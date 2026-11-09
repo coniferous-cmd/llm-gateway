@@ -309,7 +309,7 @@ The gateway does not require a `/v1` prefix, nor does it restrict methods or con
 - Unknown model id on a model-enabled key: `400 Bad Request`; a request body beyond the inspection limit: `413 Request Entity Too Large`. In both cases no upstream is contacted.
 - Upstream connection failure: `502 Bad Gateway`; no switch to another target. The next request continues the round-robin sequence.
 - Upstream HTTP errors such as `429`: status code and body are passed through as-is.
-- Operational JSON logs go to stdout, or to the `--log-file` destination, one line per request, with method, path (query excluded), target, status, and duration. They do not include auth headers or bodies. When conversation capture is enabled, authenticated calls also include a `request_id` linking to their separate conversation file.
+- Operational JSON logs go to stdout, or to the `--log-file` destination, one line per request, with method, path (query excluded), target, status, duration, and — when the request body was inspected — `stream`, the caller's top-level boolean indicating a streamed response (`false` when the body is a JSON object without that key). The field is absent for compressed bodies, bodies beyond the inspection limit, non-JSON bodies, and requests rejected before inspection. `stream` describes the caller's request, not the upstream's response headers. Logs do not include auth headers or bodies. When conversation capture is enabled, authenticated calls also include a `request_id` linking to their separate conversation file.
 
 ## Conversation files (opt-in)
 

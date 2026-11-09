@@ -15,7 +15,7 @@ use http_body_util::{BodyExt, Full};
 use crate::config::{Model, Target};
 use crate::keymap::Route;
 
-use super::model::{model_value, splice_model_value};
+use super::model::{model_value, splice_model_value, stream_requested};
 
 /// Bounds how much of a request body model routing reads.
 pub const MAX_INSPECTED_BODY: usize = 32 << 20;
@@ -48,6 +48,9 @@ pub struct Prepared {
     /// The caller's model id and upstream name, when one was inspected. For a
     /// legacy token both are the caller's id.
     pub model: Option<Model>,
+    /// Whether the caller asked for a streamed response, when the body was
+    /// inspected as a JSON object.
+    pub stream: Option<bool>,
     pub body: ReqBody,
     /// Whether the caller's `Content-Length` header must be removed because
     /// the body was replaced by a buffered copy.
@@ -59,6 +62,7 @@ impl std::fmt::Debug for Prepared {
         f.debug_struct("Prepared")
             .field("target", &self.target)
             .field("model", &self.model)
+            .field("stream", &self.stream)
             .field("replace_content_length", &self.replace_content_length)
             .finish_non_exhaustive()
     }
@@ -81,6 +85,7 @@ pub async fn prepare(
         return Ok(Prepared {
             target: route.round_robin(),
             model: None,
+            stream: None,
             body,
             replace_content_length: false,
         });
@@ -92,6 +97,7 @@ pub async fn prepare(
         return Ok(Prepared {
             target: route.round_robin(),
             model: None,
+            stream: None,
             body,
             replace_content_length: false,
         });
@@ -104,17 +110,20 @@ pub async fn prepare(
         return Ok(Prepared {
             target: route.round_robin(),
             model: None,
+            stream: None,
             body,
             replace_content_length: false,
         });
     }
 
+    let stream = stream_requested(&buffered);
     let inspected = model_value(&buffered);
     let Some(found) = inspected else {
         let body = full_body(buffered);
         return Ok(Prepared {
             target: route.round_robin(),
             model: None,
+            stream,
             body,
             replace_content_length: true,
         });
@@ -129,6 +138,7 @@ pub async fn prepare(
         return Ok(Prepared {
             target: route.round_robin(),
             model: Some(model),
+            stream,
             body,
             replace_content_length: true,
         });
@@ -145,6 +155,7 @@ pub async fn prepare(
     Ok(Prepared {
         target,
         model: Some(model),
+        stream,
         body,
         replace_content_length: true,
     })
@@ -365,6 +376,38 @@ mod tests {
         let prepared = prepare(route, body(&huge), None, None).await.unwrap();
         assert_eq!(collect(prepared.body).await, huge);
         assert!(!prepared.replace_content_length);
+    }
+
+    #[tokio::test]
+    async fn stream_flag_is_observed_from_the_body() {
+        let routes = route(&[("known", "real")], &["https://one"]);
+        let route = routes.select("Bearer dev").unwrap();
+        let streamed = br#"{"model":"known","stream":true}"#;
+        let prepared = prepare(route, body(streamed), Some(streamed.len() as u64), None)
+            .await
+            .unwrap();
+        assert_eq!(prepared.stream, Some(true));
+
+        let plain = br#"{"model":"known"}"#;
+        let prepared = prepare(route, body(plain), Some(plain.len() as u64), None)
+            .await
+            .unwrap();
+        assert_eq!(prepared.stream, Some(false));
+
+        // Compressed bodies are never inspected, so the flag is unknown.
+        let prepared = prepare(route, body(streamed), None, Some("gzip"))
+            .await
+            .unwrap();
+        assert_eq!(prepared.stream, None);
+    }
+
+    #[tokio::test]
+    async fn legacy_token_still_logs_the_stream_flag() {
+        let routes = route(&[], &["https://one"]);
+        let route = routes.select("Bearer dev").unwrap();
+        let original = br#"{"model":"whatever","stream":true}"#;
+        let prepared = prepare(route, body(original), None, None).await.unwrap();
+        assert_eq!(prepared.stream, Some(true));
     }
 
     #[tokio::test]
