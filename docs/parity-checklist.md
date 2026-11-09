@@ -7,7 +7,7 @@ intentional divergence.
 
 ## Status
 
-- `cargo test --all-targets`: **100 tests, 5 suites, all passing**
+- `cargo test --all-targets`: **139 tests, 5 suites, all passing**
 - `cargo clippy --all-targets -- -D warnings`: clean
 - `cargo fmt --check`: clean
 
@@ -16,9 +16,9 @@ intentional divergence.
 | Go package / area | Go tests | Rust location | Count |
 |---|---|---|---|
 | `internal/config` parsing, validation, anchors, secrets | 17 | `src/config/` (inline `#[cfg(test)]`) | 23 |
-| `internal/keymap` auth, round-robin, models, `[1m]`, expiry | 10 | `src/keymap.rs` | 7 |
+| `internal/keymap` auth, round-robin, models, `[1m]`, expiry | 10 | `src/keymap.rs` | 10 |
 | `internal/proxy` model scanner, splicing, path rewriting | 22 | `src/proxy/{model,rewrite,prepare}.rs` | 13 |
-| `internal/server` pipeline, logging, conversation lifecycle | 23 | `src/server/mod.rs` + `tests/http_e2e.rs` | 4 + 10 |
+| `internal/server` pipeline, logging, conversation lifecycle | 23 | `src/server/mod.rs` + `tests/http_e2e.rs` | 9 + 10 |
 | `internal/e2ee` handshake, framing, session | 16 | `src/e2ee/` + `tests/e2ee_e2e.rs` | 8 + 3 |
 | `internal/daemon` pid file, stop, probe address | 10 | `src/daemon/mod.rs` + `tests/cli_binary.rs` | 4 + 5 |
 | `internal/conversationlog` capture, store, collisions | 7 | `src/conversationlog/` | 9 |
@@ -62,7 +62,8 @@ combines several Go table rows into one parameterized test).
   the upstream has produced the rest and a frame split across two upstream
   writes not held back; a 429 error body is relayed verbatim; a non-streaming
   reply keeps its nested `message.model` (the gateway rewrites requests only);
-  `GET /v1/models` without a body still reaches the provider.
+  a bodyless `GET /v1/models` is answered locally instead of reaching the
+  provider (see divergence 9).
 - **Body inspection**: 32 MiB limit; request `Content-Encoding` other than
   `identity` (or empty) passes through uninspected and undecoded; model-enabled
   tokens reject larger bodies with `413`; legacy tokens replay the buffered
@@ -166,6 +167,14 @@ combines several Go table rows into one parameterized test).
     layered coding becomes a `502` instead of an opaque pass-through, and a
     mid-stream decode failure keeps the delivered prefix but marks the call
     incomplete with `upstream_decode`.
+11. **Local model list.** The Go reference forwards a bodyless `GET /v1/models`
+    upstream. This rewrite answers it locally for the authenticated key: the
+    path is matched after the selected target's rewrite rules, and the
+    response lists the token's declared `id` values (live entries only, in
+    declaration order) in the Anthropic shape when `anthropic-version` is
+    present and in the OpenAI shape otherwise. A token without `models` gets
+    an empty list, so an upstream catalog is never exposed through the
+    gateway, and the round-robin counter is not advanced.
 
 ## Not done
 

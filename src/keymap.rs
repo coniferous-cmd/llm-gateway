@@ -95,6 +95,38 @@ impl Route {
         !self.by_model.is_empty()
     }
 
+    /// The model ids this token declares across its live entries, in
+    /// declaration order. A token without `models` yields an empty list.
+    pub fn model_ids(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut ids = Vec::new();
+        for entry in &self.entries {
+            if expired(&entry.target) {
+                continue;
+            }
+            for model in &entry.models {
+                if seen.insert(model.id.as_str()) {
+                    ids.push(model.id.clone());
+                }
+            }
+        }
+        ids
+    }
+
+    /// The target the next model-less request would receive, without
+    /// advancing the round-robin counter. Used to choose the rules for a
+    /// locally answered request.
+    pub fn peek(&self) -> Target {
+        let live: Vec<&Entry> = self
+            .entries
+            .iter()
+            .filter(|entry| !expired(&entry.target))
+            .collect();
+        debug_assert!(!live.is_empty(), "select() rejects fully expired routes");
+        let next = self.next.load(Ordering::Relaxed);
+        live[(next % live.len() as u64) as usize].target.clone()
+    }
+
     /// Map a caller's model id onto the entry declaring it. A verbatim id
     /// wins; otherwise the id without `[1m]` is tried and the suffix is
     /// appended to the entry's upstream name.
@@ -306,6 +338,40 @@ mod tests {
         let route = routes.select("Bearer dev").unwrap();
         assert!(!route.has_models());
         assert!(route.resolve("anything").is_none());
+    }
+
+    #[test]
+    fn model_ids_lists_live_declarations_in_order_once() {
+        let future = OffsetDateTime::now_utc() + Duration::hours(1);
+        let past = OffsetDateTime::now_utc() - Duration::hours(1);
+        let mut live = entry("https://live", &[("a", "real-a"), ("b", "real-b")]);
+        live.target.expire = Some(future);
+        let mut dead = entry("https://dead", &[("gone", "gone")]);
+        dead.target.expire = Some(past);
+        let routes = build_map(&[("dev", vec![dead, live, entry("https://c", &[("b", "b")])])]);
+        let route = routes.select("Bearer dev").unwrap();
+        assert_eq!(route.model_ids(), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn legacy_tokens_list_no_models() {
+        let routes = build_map(&[("dev", vec![entry("https://1", &[])])]);
+        let route = routes.select("Bearer dev").unwrap();
+        assert!(route.model_ids().is_empty());
+    }
+
+    #[test]
+    fn peek_does_not_advance_round_robin() {
+        let routes = build_map(&[(
+            "dev",
+            vec![entry("https://1", &[]), entry("https://2", &[])],
+        )]);
+        let route = routes.select("Bearer dev").unwrap();
+        assert_eq!(route.peek().base_url, "https://1");
+        assert_eq!(route.peek().base_url, "https://1");
+        assert_eq!(route.round_robin().base_url, "https://1");
+        assert_eq!(route.peek().base_url, "https://2");
+        assert_eq!(route.round_robin().base_url, "https://2");
     }
 
     #[test]

@@ -848,7 +848,7 @@ async fn authentication_model_and_transport_errors() {
     let response = client()
         .request(request(
             Method::GET,
-            &format!("http://{address}/v1/models"),
+            &format!("http://{address}/v1/ping"),
             "Bearer dev",
             &[],
             b"",
@@ -1115,23 +1115,32 @@ async fn anthropic_message_response_keeps_the_upstream_model_name() {
     gateway.stop().await;
 }
 
-/// `GET /v1/models`-style calls without a body must still reach the provider and
-/// relay its listing as-is.
+/// A bodyless model-list request is answered by the gateway for the
+/// authenticated key: the path is recognized after rewriting, the declared ids
+/// are returned in the Anthropic shape, and no provider is contacted.
 #[tokio::test]
-async fn anthropic_model_listing_passes_through_without_a_body() {
+async fn anthropic_model_listing_is_served_locally() {
     if !loopback_available() {
         eprintln!("skipping: loopback binding is unavailable in this environment");
         return;
     }
-    const LISTING: &[u8] = br#"{"data":[{"type":"model","id":"claude-real","display_name":"Claude"}],"has_more":false}"#;
-    let upstream = start_static_upstream(StatusCode::OK, "application/json", LISTING).await;
+    let upstream = start_echo_upstream().await;
     let gateway = start_gateway(
         &upstream,
         vec![RewriteRule {
             source: "/anthropic".into(),
             destination: String::new(),
         }],
-        vec![],
+        vec![
+            Model {
+                id: "mimo-flash".into(),
+                name: "real-flash".into(),
+            },
+            Model {
+                id: "mimo-pro".into(),
+                name: "real-pro".into(),
+            },
+        ],
         false,
     )
     .await;
@@ -1146,19 +1155,18 @@ async fn anthropic_model_listing_passes_through_without_a_body() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes()
-            .as_ref(),
-        LISTING
-    );
-    let records = upstream.records();
-    assert_eq!(records[0].method, Method::GET);
-    assert_eq!(records[0].uri, "/v1/models");
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["has_more"], false);
+    assert_eq!(body["data"][0]["type"], "model");
+    let ids: Vec<_> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|model| model["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["mimo-flash", "mimo-pro"]);
+    assert_eq!(upstream.records().len(), 0, "the provider is not contacted");
     gateway.stop().await;
 }
 
@@ -1271,7 +1279,7 @@ async fn brotli_only_client_gets_plaintext() {
     let response = client()
         .request(request(
             Method::GET,
-            &format!("{}/v1/models", gateway.url()),
+            &format!("{}/v1/ping", gateway.url()),
             "Bearer dev",
             &[("accept-encoding", "br")],
             b"",
@@ -1298,7 +1306,7 @@ async fn unsupported_client_coding_is_not_advertised_upstream() {
     let response = client()
         .request(request(
             Method::GET,
-            &format!("{}/v1/models", gateway.url()),
+            &format!("{}/v1/ping", gateway.url()),
             "Bearer dev",
             &[("accept-encoding", "compress, exi")],
             b"",
@@ -1331,7 +1339,7 @@ async fn missing_accept_encoding_is_not_added_upstream() {
     let response = client()
         .request(request(
             Method::GET,
-            &format!("{}/v1/models", gateway.url()),
+            &format!("{}/v1/ping", gateway.url()),
             "Bearer dev",
             &[],
             b"",
@@ -1361,7 +1369,7 @@ async fn wildcard_and_quality_values_reduce_to_the_supported_set() {
     let response = client()
         .request(request(
             Method::GET,
-            &format!("{}/v1/models", gateway.url()),
+            &format!("{}/v1/ping", gateway.url()),
             "Bearer dev",
             &[("accept-encoding", "*")],
             b"",
@@ -1377,7 +1385,7 @@ async fn wildcard_and_quality_values_reduce_to_the_supported_set() {
     let response = client()
         .request(request(
             Method::GET,
-            &format!("{}/v1/models", gateway.url()),
+            &format!("{}/v1/ping", gateway.url()),
             "Bearer dev",
             &[("accept-encoding", "gzip;q=0, deflate")],
             b"",
@@ -1451,7 +1459,7 @@ async fn unsupported_response_coding_is_rejected_before_forwarding_bytes() {
     let response = client()
         .request(request(
             Method::GET,
-            &format!("{}/v1/models", gateway.url()),
+            &format!("{}/v1/ping", gateway.url()),
             "Bearer dev",
             &[("accept-encoding", "gzip")],
             b"",
@@ -1480,7 +1488,7 @@ async fn layered_response_coding_is_rejected() {
     let response = client()
         .request(request(
             Method::GET,
-            &format!("{}/v1/models", gateway.url()),
+            &format!("{}/v1/ping", gateway.url()),
             "Bearer dev",
             &[("accept-encoding", "gzip, br")],
             b"",
@@ -1503,7 +1511,7 @@ async fn bodyless_responses_keep_their_coding_headers() {
     let response = client()
         .request(request(
             Method::HEAD,
-            &format!("{}/v1/models", gateway.url()),
+            &format!("{}/v1/ping", gateway.url()),
             "Bearer dev",
             &[("accept-encoding", "gzip")],
             b"",
@@ -1529,7 +1537,7 @@ async fn bodyless_responses_keep_their_coding_headers() {
     let response = client()
         .request(request(
             Method::GET,
-            &format!("{}/v1/models", gateway.url()),
+            &format!("{}/v1/ping", gateway.url()),
             "Bearer dev",
             &[("accept-encoding", "gzip")],
             b"",
@@ -1561,7 +1569,7 @@ async fn empty_body_with_a_coding_is_delivered_empty() {
     let response = client()
         .request(request(
             Method::GET,
-            &format!("{}/v1/models", gateway.url()),
+            &format!("{}/v1/ping", gateway.url()),
             "Bearer dev",
             &[("accept-encoding", "gzip")],
             b"",
@@ -1653,7 +1661,7 @@ async fn binary_decoded_response_is_recorded_as_base64() {
     let response = client()
         .request(request(
             Method::GET,
-            &format!("{}/v1/models", gateway.url()),
+            &format!("{}/v1/ping", gateway.url()),
             "Bearer dev",
             &[("accept-encoding", "gzip")],
             b"",
@@ -1694,7 +1702,7 @@ async fn truncated_gzip_marks_the_record_incomplete() {
     if let Ok(response) = client()
         .request(request(
             Method::GET,
-            &format!("{}/v1/models", gateway.url()),
+            &format!("{}/v1/ping", gateway.url()),
             "Bearer dev",
             &[("accept-encoding", "gzip")],
             b"",

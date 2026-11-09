@@ -69,13 +69,37 @@ When the authenticated token declares at least one model `id` across its entries
 
 #### Scenario: Request without a model field
 
-- **WHEN** an authenticated `GET /v1/models` or a request with a non-JSON body arrives
+- **WHEN** an authenticated request with a non-JSON body arrives
 - **THEN** the gateway performs no model lookup, forwards the body bytes unchanged, and selects the target by round-robin across the token's entries
 
 #### Scenario: Token declares no models
 
 - **WHEN** a config predates `models` (no entry of the token declares `models`) and a request body carries any `model` value
 - **THEN** the request is forwarded unchanged by round-robin across the token's entries, exactly as before this change
+
+### Requirement: Local model listing
+
+A bodyless `GET` whose path, after the selected target's rewrite rules, equals `/v1/models` SHALL be answered by the gateway itself, contacting no provider. The response SHALL list the `id` of every model declared by a live entry of the authenticated token, once each, in declaration order; models on entries past their `expire` time SHALL be omitted. The token's round-robin counter SHALL NOT advance. When the request carries an `anthropic-version` header the Anthropic shape SHALL be returned (`data` of `{type: "model", id, ...}`, `has_more: false`, `first_id`, `last_id`); otherwise the OpenAI shape (`object: "list"`, `data` of `{id, object: "model", ...}`). A token that declares no `models` SHALL receive an empty `data` list, never the provider's catalog.
+
+#### Scenario: Listing for a model-enabled key
+
+- **WHEN** token `sk-dev` declares `mimo-v2.6-flash` on one entry and `mimo-v2.6-pro` on another, and the request is a bodyless `GET /v1/models`
+- **THEN** the gateway returns both ids and no provider is contacted
+
+#### Scenario: Listing uses the Anthropic shape on request
+
+- **WHEN** the same request carries `anthropic-version`
+- **THEN** the response uses `data[].type = "model"` and `has_more = false`
+
+#### Scenario: Listing for a legacy key
+
+- **WHEN** a token declares no `models` and the request is a bodyless `GET /v1/models`
+- **THEN** the gateway returns an empty `data` list and no provider is contacted
+
+#### Scenario: Listing path after rewriting
+
+- **WHEN** the selected target maps `/anthropic` to the empty prefix and the request is `GET /anthropic/v1/models`
+- **THEN** the gateway answers locally because the rewritten path is `/v1/models`
 
 ### Requirement: Model name rewrite
 

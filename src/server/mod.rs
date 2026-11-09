@@ -21,17 +21,25 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
-use crate::config::Model;
+use crate::config::{Model, Target};
 use crate::conversationlog::{Call, Store};
-use crate::keymap::Map;
+use crate::keymap::{Map, Route};
 use crate::logging::{JsonLogger, fields};
 use crate::proxy::decode::{self, DecodeError, ReadBody};
 use crate::proxy::forward::{BoxError as ForwardError, Forwarder, box_response};
 use crate::proxy::prepare::{self, PrepareError, ReqBody};
+use crate::proxy::rewrite::rewrite_path;
 
 /// Digest of the encoded representation; it no longer describes the decoded
 /// body, so it is dropped with `Content-Encoding`.
 const CONTENT_MD5: http::header::HeaderName = http::header::HeaderName::from_static("content-md5");
+
+/// Presence of this header selects the Anthropic model-list shape.
+const ANTHROPIC_VERSION: http::header::HeaderName =
+    http::header::HeaderName::from_static("anthropic-version");
+
+/// The path, after the selected target's rewrite rules, answered locally.
+const MODEL_LIST_PATH: &str = "/v1/models";
 
 pub struct AppState {
     pub keys: Arc<Map>,
@@ -155,6 +163,7 @@ where
         .decode_utf8_lossy()
         .into_owned();
     let content_length = request.body().size_hint().exact();
+    let bodyless = request.body().is_end_stream() || content_length == Some(0);
     let content_encoding = headers
         .get(CONTENT_ENCODING)
         .and_then(|value| value.to_str().ok())
@@ -220,6 +229,28 @@ where
             StatusCode::BAD_GATEWAY,
             "Bad Gateway\n",
         ));
+    }
+
+    // The model list belongs to the authenticated key, not to a provider, so
+    // it is answered here: every live entry contributes its declared ids and
+    // no upstream is contacted. The target is only peeked so the rules used
+    // to recognize the path come from the entry the request would have
+    // reached, without advancing the round-robin counter.
+    if method == Method::GET && bodyless && is_model_list(&uri, &route.peek()) {
+        let body = model_list_json(&route, headers.contains_key(ANTHROPIC_VERSION));
+        let request_state = RequestState::new(
+            started,
+            method.as_str().to_string(),
+            decoded_path,
+            String::new(),
+            None,
+            None,
+            StatusCode::OK.as_u16(),
+            call.clone(),
+            state.recorder.clone(),
+            state.logger.clone(),
+        );
+        return Ok(finish_local_json(request_state, StatusCode::OK, &body));
     }
 
     let prepared = match prepare::prepare(
@@ -365,6 +396,68 @@ where
     }
 }
 
+/// Whether the request's path, after the selected target's rewrite rules,
+/// names the locally answered model list. The query string is ignored.
+fn is_model_list(uri: &http::Uri, target: &Target) -> bool {
+    let original = uri
+        .path_and_query()
+        .map_or("/", http::uri::PathAndQuery::as_str);
+    let path = rewrite_path(original, &target.rewrite).unwrap_or_else(|| original.to_string());
+    path.split('?').next() == Some(MODEL_LIST_PATH)
+}
+
+/// Serialize the key's declared model ids in the shape the caller's SDK
+/// expects: Anthropic when `anthropic-version` was sent, OpenAI otherwise.
+fn model_list_json(route: &Route, anthropic: bool) -> String {
+    let ids = route.model_ids();
+    let value = if anthropic {
+        let data: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                json!({
+                    "type": "model",
+                    "id": id,
+                    "display_name": id,
+                    "created_at": "1970-01-01T00:00:00Z",
+                })
+            })
+            .collect();
+        json!({
+            "data": data,
+            "has_more": false,
+            "first_id": ids.first(),
+            "last_id": ids.last(),
+        })
+    } else {
+        let data: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                json!({
+                    "id": id,
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "llm-gateway",
+                })
+            })
+            .collect();
+        json!({"object": "list", "data": data})
+    };
+    value.to_string()
+}
+
+fn finish_local_json(
+    state: Arc<RequestState>,
+    status: StatusCode,
+    text: &str,
+) -> Response<ReqBody> {
+    state.set_status(status.as_u16());
+    if let Some(call) = &state.call {
+        call.response.observe(text.as_bytes(), true, false);
+    }
+    state.finish();
+    json_response(status, text)
+}
+
 fn finish_local(state: Arc<RequestState>, status: StatusCode, text: &str) -> Response<ReqBody> {
     state.set_status(status.as_u16());
     if let Some(call) = &state.call {
@@ -388,6 +481,18 @@ fn empty_body() -> ReqBody {
     Full::new(Bytes::new())
         .map_err(|never: Infallible| match never {})
         .boxed_unsync()
+}
+
+fn json_response(status: StatusCode, text: &str) -> Response<ReqBody> {
+    let body = Full::new(Bytes::copy_from_slice(text.as_bytes()))
+        .map_err(|never: Infallible| match never {})
+        .boxed_unsync();
+    let mut response = Response::new(body);
+    *response.status_mut() = status;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    response
 }
 
 fn error_response(status: StatusCode, text: &str) -> Response<ReqBody> {
@@ -631,7 +736,7 @@ impl Drop for ObservedBody {
 mod tests {
     use std::collections::HashMap;
 
-    use http_body_util::Full;
+    use http_body_util::{BodyExt, Full};
     use serde_json::Value;
     use tempfile::tempdir;
 
@@ -777,6 +882,108 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0]["stream"], true);
         assert_eq!(lines[1]["stream"], false);
+    }
+
+    async fn json_body(response: Response<ReqBody>) -> Value {
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn model_list_is_answered_locally_for_the_openai_shape() {
+        let temp = tempdir().unwrap();
+        let state = state(
+            temp.path(),
+            vec![
+                entry(&[("mimo-flash", "real-flash"), ("mimo-pro", "real-pro")]),
+                entry(&[("mimo-max", "real-max")]),
+            ],
+        );
+        let response = handle(state, request(Method::GET, "/v1/models", "Bearer dev", b""))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let body = json_body(response).await;
+        assert_eq!(body["object"], "list");
+        let ids: Vec<_> = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|model| model["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["mimo-flash", "mimo-pro", "mimo-max"]);
+        assert_eq!(body["data"][0]["object"], "model");
+    }
+
+    #[tokio::test]
+    async fn model_list_uses_the_anthropic_shape_when_asked() {
+        let temp = tempdir().unwrap();
+        let state = state(temp.path(), vec![entry(&[("mimo-flash", "real")])]);
+        let mut request = request(Method::GET, "/v1/models", "Bearer dev", b"");
+        request
+            .headers_mut()
+            .insert(ANTHROPIC_VERSION, HeaderValue::from_static("2023-06-01"));
+        let response = handle(state, request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["has_more"], false);
+        assert_eq!(body["data"][0]["type"], "model");
+        assert_eq!(body["data"][0]["id"], "mimo-flash");
+        assert_eq!(body["first_id"], "mimo-flash");
+        assert_eq!(body["last_id"], "mimo-flash");
+    }
+
+    #[tokio::test]
+    async fn model_list_is_empty_for_a_legacy_token() {
+        let temp = tempdir().unwrap();
+        let state = state(temp.path(), vec![entry(&[])]);
+        let response = handle(state, request(Method::GET, "/v1/models", "Bearer dev", b""))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["data"].as_array().unwrap().len(), 0);
+        assert!(body.get("first_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn model_list_is_recognized_after_path_rewriting() {
+        use crate::config::RewriteRule;
+
+        let temp = tempdir().unwrap();
+        let mut entry = entry(&[("mimo-flash", "real")]);
+        entry.target.rewrite = vec![RewriteRule {
+            source: "/anthropic".into(),
+            destination: String::new(),
+        }];
+        let state = state(temp.path(), vec![entry]);
+        let response = handle(
+            state,
+            request(Method::GET, "/anthropic/v1/models", "Bearer dev", b""),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["data"][0]["id"], "mimo-flash");
+    }
+
+    #[tokio::test]
+    async fn other_paths_are_still_forwarded() {
+        let temp = tempdir().unwrap();
+        let state = state(temp.path(), vec![entry(&[("mimo-flash", "real")])]);
+        let response = handle(
+            state,
+            request(Method::GET, "/v1/models/extra", "Bearer dev", b""),
+        )
+        .await
+        .unwrap();
+        // No upstream listens on the configured address.
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]
