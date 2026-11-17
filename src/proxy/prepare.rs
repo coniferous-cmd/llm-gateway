@@ -303,6 +303,57 @@ mod tests {
         assert!(prepared.replace_content_length);
     }
 
+    // Sorting messages by role, moving system messages to the front, or
+    // rebuilding the JSON during model routing must break this test.
+    #[tokio::test]
+    async fn preserves_message_order_and_bytes_across_model_routing_modes() {
+        let cases = [
+            (
+                "system_then_user",
+                r#"[{"role":"system","content":"Follow the rules."}, {"role":"user","content":"Hello"}]"#,
+            ),
+            (
+                "user_then_system",
+                r#"[{"role":"user","content":"Hello"}, {"role":"system","content":"Follow the rules."}]"#,
+            ),
+            (
+                "multi_turn",
+                r#"[{"role":"system","content":"Follow the rules."}, {"role":"user","content":"Hello"}, {"role":"assistant","content":"Hi"}, {"role":"user","content":"Next question"}]"#,
+            ),
+        ];
+        for (mode, models, expected_model) in [
+            ("alias", vec![("alias", "real")], "real"),
+            ("identical_name", vec![("alias", "alias")], "alias"),
+            ("legacy", vec![], "alias"),
+        ] {
+            let routes = route(&models, &["https://one"]);
+            let route = routes.select("Bearer dev").unwrap();
+            for (case, messages) in cases {
+                // Keep non-canonical whitespace and put messages before model
+                // so inspection must skip the array without changing it.
+                let original = format!(
+                    "{{\n  \"messages\" : {messages},\n  \"model\":\"alias\", \"stream\":false\n}}"
+                );
+                let expected = format!(
+                    "{{\n  \"messages\" : {messages},\n  \"model\":\"{expected_model}\", \"stream\":false\n}}"
+                );
+                let prepared = prepare(
+                    route,
+                    body(original.as_bytes()),
+                    Some(original.len() as u64),
+                    None,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    collect(prepared.body).await,
+                    expected.as_bytes(),
+                    "mode={mode}, case={case}"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn identical_id_and_name_keeps_bytes() {
         let routes = route(&[("same", "same")], &["https://one"]);
