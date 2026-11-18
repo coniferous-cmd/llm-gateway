@@ -17,7 +17,10 @@ pub fn validate(root: &Node) -> Result<(), ConfigError> {
             }
             if let Some(models) = yaml::field(entry, "models").and_then(yaml::sequence) {
                 for model in models {
-                    yaml::check_unknown(model, &["id", "name"])?;
+                    yaml::check_unknown(
+                        model,
+                        &["id", "name", "max_input_token", "max_output_token"],
+                    )?;
                 }
             }
         }

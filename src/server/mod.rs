@@ -406,43 +406,67 @@ fn is_model_list(uri: &http::Uri, target: &Target) -> bool {
     path.split('?').next() == Some(MODEL_LIST_PATH)
 }
 
-/// Serialize the key's declared model ids in the shape the caller's SDK
-/// expects: Anthropic when `anthropic-version` was sent, OpenAI otherwise.
+/// Serialize the key's declared models in the shape the caller's SDK expects:
+/// Anthropic when `anthropic-version` was sent, OpenAI otherwise.
 fn model_list_json(route: &Route, anthropic: bool) -> String {
-    let ids = route.model_ids();
+    let models = route.models();
+    let entries: Vec<serde_json::Value> = models
+        .iter()
+        .map(|model| model_entry(model, anthropic))
+        .collect();
+    let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
     let value = if anthropic {
-        let data: Vec<_> = ids
-            .iter()
-            .map(|id| {
-                json!({
-                    "type": "model",
-                    "id": id,
-                    "display_name": id,
-                    "created_at": "1970-01-01T00:00:00Z",
-                })
-            })
-            .collect();
         json!({
-            "data": data,
+            "data": entries,
             "has_more": false,
             "first_id": ids.first(),
             "last_id": ids.last(),
         })
     } else {
-        let data: Vec<_> = ids
-            .iter()
-            .map(|id| {
-                json!({
-                    "id": id,
-                    "object": "model",
-                    "created": 0,
-                    "owned_by": "llm-gateway",
-                })
-            })
-            .collect();
-        json!({"object": "list", "data": data})
+        json!({"object": "list", "data": entries})
     };
     value.to_string()
+}
+
+/// One model-list entry, in the shape `anthropic` selects, carrying the
+/// configured token limits under the wire names the official schema uses —
+/// `max_input_tokens` for the context window and `max_tokens` for the output
+/// cap. The configuration spells them `max_input_token` / `max_output_token`;
+/// a client reading the official fields is what these names exist for.
+///
+/// The Anthropic `ModelInfo` defines both fields as "number or null" and
+/// always includes them, so an undeclared limit goes out as `null`. OpenAI's
+/// `Model` has no token-limit field at all, so there an undeclared limit is
+/// omitted rather than inventing a `null` for a name no schema owns; a
+/// declared one is still published under the Anthropic spelling, since that
+/// is the only convention these fields have.
+fn model_entry(model: &Model, anthropic: bool) -> serde_json::Value {
+    if anthropic {
+        return json!({
+            "type": "model",
+            "id": model.id,
+            "display_name": model.id,
+            "created_at": "1970-01-01T00:00:00Z",
+            "max_input_tokens": model.max_input_token,
+            "max_tokens": model.max_output_token,
+        });
+    }
+
+    let mut entry = json!({
+        "id": model.id,
+        "object": "model",
+        "created": 0,
+        "owned_by": "llm-gateway",
+    });
+    if let Some(map) = entry.as_object_mut() {
+        if let Some(limit) = model.max_input_token {
+            map.insert("max_input_tokens".to_string(), json!(limit));
+        }
+        if let Some(limit) = model.max_output_token {
+            map.insert("max_tokens".to_string(), json!(limit));
+        }
+    }
+    entry
 }
 
 fn finish_local_json(
@@ -768,6 +792,7 @@ mod tests {
                 .map(|(id, name)| Model {
                     id: (*id).into(),
                     name: (*name).into(),
+                    ..Model::default()
                 })
                 .collect(),
         }
@@ -935,6 +960,90 @@ mod tests {
         assert_eq!(body["data"][0]["id"], "mimo-flash");
         assert_eq!(body["first_id"], "mimo-flash");
         assert_eq!(body["last_id"], "mimo-flash");
+    }
+
+    /// One entry whose models declare limits in three combinations: both,
+    /// output only, and none.
+    fn entry_with_limits() -> Entry {
+        let mut entry = entry(&[("full", "real-full")]);
+        entry.models.push(Model {
+            id: "output-only".into(),
+            name: "real-output-only".into(),
+            max_output_token: Some(32_000),
+            ..Model::default()
+        });
+        entry.models.push(Model {
+            id: "undeclared".into(),
+            name: "real-undeclared".into(),
+            ..Model::default()
+        });
+        entry.models[0].max_input_token = Some(1_000_000);
+        entry.models[0].max_output_token = Some(128_000);
+        entry
+    }
+
+    fn model_list(body: &Value) -> Vec<Value> {
+        body["data"].as_array().unwrap().clone()
+    }
+
+    /// The wire name the configuration's `max_input_token` becomes: the
+    /// Anthropic `ModelInfo` field a client written against the official
+    /// schema actually reads.
+    const INPUT_FIELD: &str = "max_input_tokens";
+    /// And `max_output_token` becomes `max_tokens`, the official cap on the
+    /// request's own `max_tokens` parameter.
+    const OUTPUT_FIELD: &str = "max_tokens";
+
+    /// Whether an entry carries a key at all, as opposed to carrying `null`.
+    fn carries(entry: &Value, key: &str) -> bool {
+        entry.get(key).is_some()
+    }
+
+    #[tokio::test]
+    async fn model_list_carries_declared_token_limits() {
+        let temp = tempdir().unwrap();
+        let models = vec![entry_with_limits()];
+        let state = state(temp.path(), models);
+        let response = handle(state, request(Method::GET, "/v1/models", "Bearer dev", b""))
+            .await
+            .unwrap();
+        let body = json_body(response).await;
+        let data = model_list(&body);
+        assert_eq!(data[0][INPUT_FIELD], 1_000_000);
+        assert_eq!(data[0][OUTPUT_FIELD], 128_000);
+        assert_eq!(data[1][OUTPUT_FIELD], 32_000);
+        // OpenAI's Model schema has no limit fields, so an undeclared one is
+        // omitted here rather than sent as the null Anthropic's schema owns.
+        assert!(!carries(&data[1], INPUT_FIELD));
+        assert!(!carries(&data[2], INPUT_FIELD));
+        assert!(!carries(&data[2], OUTPUT_FIELD));
+        // The configuration spellings never reach the wire.
+        assert!(!carries(&data[0], "max_input_token"));
+        assert!(!carries(&data[0], "max_output_token"));
+    }
+
+    #[tokio::test]
+    async fn model_list_carries_limits_in_the_anthropic_shape() {
+        let temp = tempdir().unwrap();
+        let state = state(temp.path(), vec![entry_with_limits()]);
+        let mut request = request(Method::GET, "/v1/models", "Bearer dev", b"");
+        request
+            .headers_mut()
+            .insert(ANTHROPIC_VERSION, HeaderValue::from_static("2023-06-01"));
+        let response = handle(state, request).await.unwrap();
+        let body = json_body(response).await;
+        let data = model_list(&body);
+        assert_eq!(data[0]["type"], "model");
+        assert_eq!(data[0][INPUT_FIELD], 1_000_000);
+        assert_eq!(data[0][OUTPUT_FIELD], 128_000);
+        assert_eq!(data[1][INPUT_FIELD], Value::Null);
+        assert_eq!(data[1][OUTPUT_FIELD], 32_000);
+        // Anthropic's ModelInfo declares both fields as "number or null" and
+        // always includes them: undeclared means null, not absent.
+        assert!(carries(&data[2], INPUT_FIELD));
+        assert!(carries(&data[2], OUTPUT_FIELD));
+        assert_eq!(data[2][INPUT_FIELD], Value::Null);
+        assert_eq!(data[2][OUTPUT_FIELD], Value::Null);
     }
 
     #[tokio::test]

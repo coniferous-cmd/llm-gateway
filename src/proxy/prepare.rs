@@ -130,9 +130,11 @@ pub async fn prepare(
     };
 
     if !enforces_limit {
+        // A legacy token declares no model, so it has no limits to report.
         let model = Model {
             id: found.value.clone(),
             name: found.value.clone(),
+            ..Model::default()
         };
         let body = full_body(buffered);
         return Ok(Prepared {
@@ -271,6 +273,7 @@ mod tests {
                         .map(|(id, name)| Model {
                             id: (*id).into(),
                             name: (*name).into(),
+                            ..Model::default()
                         })
                         .collect()
                 } else {

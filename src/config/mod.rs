@@ -69,12 +69,18 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Model {
     /// The model name callers put in requests.
     pub id: String,
     /// The model name the provider receives.
     pub name: String,
+    /// Advertised input limit, in tokens. Purely informational: the gateway
+    /// has no tokenizer, so it never measures a request against this.
+    pub max_input_token: Option<u64>,
+    /// Advertised output limit, in tokens. Also purely informational: the
+    /// caller's `max_tokens` is forwarded exactly as sent.
+    pub max_output_token: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -476,9 +482,38 @@ fn parse_models(
                 format!("{context}.id {id:?} is already declared for this token"),
             ));
         }
-        models.push(Model { id, name });
+        models.push(Model {
+            id,
+            name,
+            max_input_token: token_limit(item, "max_input_token", &context)?,
+            max_output_token: token_limit(item, "max_output_token", &context)?,
+        });
     }
     Ok(models)
+}
+
+/// An optional, positive token count. Omitted, null and `null`-valued all
+/// mean "not declared", so a model with no limits stays unadvertised rather
+/// than claiming zero.
+fn token_limit(node: &Node, name: &str, context: &str) -> Result<Option<u64>, ConfigError> {
+    let Some(value) = yaml::field(node, name) else {
+        return Ok(None);
+    };
+    if yaml::is_null(value) {
+        return Ok(None);
+    }
+    let invalid = || {
+        ConfigError::at(
+            yaml::line(value),
+            format!("{context}.{name} must be a positive integer"),
+        )
+    };
+    let limit = yaml::scalar_integer(value).ok_or_else(invalid)?;
+    let limit = u64::try_from(limit).map_err(|_| invalid())?;
+    if limit == 0 {
+        return Err(invalid());
+    }
+    Ok(Some(limit))
 }
 
 fn string_field(node: &Node, name: &str, context: &str) -> Result<Option<String>, ConfigError> {
@@ -585,6 +620,61 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("already declared"), "{err}");
+    }
+
+    #[test]
+    fn parses_optional_model_token_limits() {
+        let cfg = parse(
+            "keys:\n  - token: dev\n    target: {base_url: https://example.com}\n    models:\n      - {id: a, name: A, max_input_token: 1000000, max_output_token: 16384}\n      - {id: b, name: B}\n      - {id: c, name: C, max_input_token: null, max_output_token: 8192}\n",
+        )
+        .unwrap();
+        let models = &cfg.keys["dev"][0].models;
+        assert_eq!(
+            models[0],
+            Model {
+                id: "a".into(),
+                name: "A".into(),
+                max_input_token: Some(1_000_000),
+                max_output_token: Some(16_384),
+            }
+        );
+        // Omitted and explicit null both mean "not declared".
+        assert_eq!(models[1].max_input_token, None);
+        assert_eq!(models[1].max_output_token, None);
+        assert_eq!(models[2].max_input_token, None);
+        assert_eq!(models[2].max_output_token, Some(8192));
+    }
+
+    #[test]
+    fn rejects_invalid_model_token_limits() {
+        for (field, value) in [
+            ("max_input_token", "0"),
+            ("max_input_token", "-1"),
+            ("max_input_token", "'many'"),
+            ("max_input_token", "1.5"),
+            ("max_output_token", "0"),
+            ("max_output_token", "-2"),
+            ("max_output_token", "true"),
+        ] {
+            let source = format!(
+                "keys:\n  - token: dev\n    target:\n      base_url: https://example.com\n    models:\n      - {{id: m, name: M, {field}: {value}}}\n"
+            );
+            let err = parse(&source).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("models[0].{field} must be a positive integer")),
+                "{source}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_plural_limit_spelling_as_unknown() {
+        let err = parse(
+            "keys:\n  - token: dev\n    target: {base_url: https://example.com}\n    models: [{id: m, name: M, max_input_tokens: 1000000}]\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown configuration field"), "{err}");
     }
 
     #[test]

@@ -43,11 +43,21 @@ keys:
     # send in their requests, "name" is the model name the provider receives.
     # A caller id ending in [1m] falls back to the id without that suffix and
     # the suffix is appended to "name" (e.g. mimo-v2.6-pro[1m]).
+    # max_input_token / max_output_token are optional positive integers, and
+    # are ADVERTISEMENT ONLY: /v1/models reports them to callers, the gateway
+    # never measures a request against them and never rewrites the caller's
+    # max_tokens. They leave the gateway under Anthropic's official wire names
+    # (max_input_token -> max_input_tokens, max_output_token -> max_tokens), so
+    # omitting one just means that field is declared as unknown to clients.
     models:
       - id: mimo-v2.6-flash
         name: mimo-v2.6-flash
+        max_input_token: 262144
+        max_output_token: 16384
       - id: mimo-v2.6-pro
         name: mimo-v2.6-pro
+        max_input_token: 1048576
+        max_output_token: 131072
   # Repeat a token to round-robin across compatible upstreams. Each target
   # has its own rules; e.g. another sk-virt-dev target could use:
   #- token: sk-virt-dev

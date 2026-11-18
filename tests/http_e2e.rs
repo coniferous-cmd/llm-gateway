@@ -757,6 +757,7 @@ async fn path_rewrite_and_model_alias_reach_the_provider() {
         vec![Model {
             id: "alias".into(),
             name: "real-model".into(),
+            ..Model::default()
         }],
         false,
     )
@@ -795,6 +796,7 @@ async fn authentication_model_and_transport_errors() {
         vec![Model {
             id: "known".into(),
             name: "real".into(),
+            ..Model::default()
         }],
         false,
     )
@@ -927,6 +929,7 @@ async fn anthropic_messages_request_is_routed_without_protocol_changes() {
         vec![Model {
             id: "alias".into(),
             name: "claude-real".into(),
+            ..Model::default()
         }],
         false,
     )
@@ -1088,6 +1091,7 @@ async fn anthropic_message_response_keeps_the_upstream_model_name() {
         vec![Model {
             id: "alias".into(),
             name: "claude-real".into(),
+            ..Model::default()
         }],
         false,
     )
@@ -1135,10 +1139,12 @@ async fn anthropic_model_listing_is_served_locally() {
             Model {
                 id: "mimo-flash".into(),
                 name: "real-flash".into(),
+                ..Model::default()
             },
             Model {
                 id: "mimo-pro".into(),
                 name: "real-pro".into(),
+                ..Model::default()
             },
         ],
         false,

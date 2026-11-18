@@ -95,22 +95,24 @@ impl Route {
         !self.by_model.is_empty()
     }
 
-    /// The model ids this token declares across its live entries, in
-    /// declaration order. A token without `models` yields an empty list.
-    pub fn model_ids(&self) -> Vec<String> {
+    /// The models this token declares across its live entries, in declaration
+    /// order. Ids are unique within a token because the parser rejects a
+    /// duplicate, so each id appears once. A token without `models` yields an
+    /// empty list.
+    pub fn models(&self) -> Vec<Model> {
         let mut seen = std::collections::HashSet::new();
-        let mut ids = Vec::new();
+        let mut models = Vec::new();
         for entry in &self.entries {
             if expired(&entry.target) {
                 continue;
             }
             for model in &entry.models {
                 if seen.insert(model.id.as_str()) {
-                    ids.push(model.id.clone());
+                    models.push(model.clone());
                 }
             }
         }
-        ids
+        models
     }
 
     /// The target the next model-less request would receive, without
@@ -147,6 +149,9 @@ impl Route {
             Model {
                 id: id.to_string(),
                 name: format!("{}{LONG_CONTEXT_SUFFIX}", found.model.name),
+                // Declared limits describe the model, so they survive the
+                // `[1m]` fallback.
+                ..found.model.clone()
             },
         ))
     }
@@ -195,6 +200,7 @@ mod tests {
                 .map(|(id, name)| Model {
                     id: (*id).to_string(),
                     name: (*name).to_string(),
+                    ..Model::default()
                 })
                 .collect(),
         }
@@ -281,7 +287,8 @@ mod tests {
             model,
             Model {
                 id: "m".into(),
-                name: "first".into()
+                name: "first".into(),
+                ..Model::default()
             }
         );
         assert!(route.resolve("nope").is_none());
@@ -291,17 +298,20 @@ mod tests {
 
     #[test]
     fn long_context_suffix_falls_back_and_keeps_the_marker() {
+        let mut long = entry("https://1", &[("claude-haiku-5-5", "deepseek-v4.1-flash")]);
+        long.models[0].max_input_token = Some(1_000_000);
+        long.models[0].max_output_token = Some(128_000);
         let routes = build_map(&[(
             "dev",
-            vec![
-                entry("https://1", &[("claude-haiku-5-5", "deepseek-v4.1-flash")]),
-                entry("https://2", &[("explicit[1m]", "verbatim")]),
-            ],
+            vec![long, entry("https://2", &[("explicit[1m]", "verbatim")])],
         )]);
         let route = routes.select("Bearer dev").unwrap();
         let (_, model) = route.resolve("claude-haiku-5-5[1m]").unwrap();
         assert_eq!(model.id, "claude-haiku-5-5[1m]");
         assert_eq!(model.name, "deepseek-v4.1-flash[1m]");
+        // Declared limits belong to the model, so the fallback keeps them.
+        assert_eq!(model.max_input_token, Some(1_000_000));
+        assert_eq!(model.max_output_token, Some(128_000));
         let (_, model) = route.resolve("explicit[1m]").unwrap();
         assert_eq!(model.name, "verbatim");
         for id in ["unknown[1m]", "[1m]", "claude-haiku-5-5[1M]"] {
@@ -350,14 +360,15 @@ mod tests {
         dead.target.expire = Some(past);
         let routes = build_map(&[("dev", vec![dead, live, entry("https://c", &[("b", "b")])])]);
         let route = routes.select("Bearer dev").unwrap();
-        assert_eq!(route.model_ids(), vec!["a", "b"]);
+        let ids: Vec<String> = route.models().into_iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec!["a", "b"]);
     }
 
     #[test]
     fn legacy_tokens_list_no_models() {
         let routes = build_map(&[("dev", vec![entry("https://1", &[])])]);
         let route = routes.select("Bearer dev").unwrap();
-        assert!(route.model_ids().is_empty());
+        assert!(route.models().is_empty());
     }
 
     #[test]
