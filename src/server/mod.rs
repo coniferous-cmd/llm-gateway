@@ -349,7 +349,8 @@ where
             } else {
                 match decode::classify(&parts.headers) {
                     Ok(coding) => coding,
-                    Err(_) => {
+                    Err(error) => {
+                        let _ = request_state.error_detail.set(error.to_string());
                         request_state.fail("upstream_encoding");
                         return Ok(finish_local(
                             request_state,
@@ -389,7 +390,15 @@ where
             .boxed_unsync();
             Ok(Response::from_parts(parts, body))
         }
-        Err(_) => {
+        Err(error) => {
+            let mut detail = error.to_string();
+            let mut source = error.source();
+            while let Some(cause) = source {
+                detail.push_str(": ");
+                detail.push_str(&cause.to_string());
+                source = cause.source();
+            }
+            let _ = request_state.error_detail.set(detail);
             request_state.fail("upstream_transport");
             Ok(finish_local(
                 request_state,
@@ -554,6 +563,8 @@ pub struct RequestState {
     recorder: Option<Arc<Store>>,
     logger: Arc<JsonLogger>,
     finalized: AtomicBool,
+    error_category: OnceLock<&'static str>,
+    error_detail: OnceLock<String>,
     expected_response_bytes: AtomicU64,
     /// A model id the caller asked for that nothing under the token serves.
     /// Kept apart from `model`, which only ever holds a resolved model, so a
@@ -587,6 +598,8 @@ impl RequestState {
             recorder,
             logger,
             finalized: AtomicBool::new(false),
+            error_category: OnceLock::new(),
+            error_detail: OnceLock::new(),
             expected_response_bytes: AtomicU64::new(u64::MAX),
             rejected_model: OnceLock::new(),
         })
@@ -617,6 +630,7 @@ impl RequestState {
     }
 
     fn fail(&self, category: &'static str) {
+        let _ = self.error_category.set(category);
         if let Some(call) = &self.call {
             call.fail(category);
         }
@@ -651,7 +665,19 @@ impl RequestState {
         if let Some(call) = &self.call {
             event.insert("request_id".into(), json!(call.id()));
         }
-        self.logger.info("request", event);
+        if let Some(category) = self.error_category.get() {
+            event.insert("error_category".into(), json!(category));
+        } else if status == StatusCode::BAD_GATEWAY.as_u16() {
+            event.insert("error_category".into(), json!("upstream_status"));
+        }
+        if let Some(detail) = self.error_detail.get() {
+            event.insert("error".into(), json!(detail));
+        }
+        if status == StatusCode::BAD_GATEWAY.as_u16() {
+            self.logger.error("request", event);
+        } else {
+            self.logger.info("request", event);
+        }
     }
 }
 
@@ -1130,5 +1156,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         let lines = log_lines(temp.path()).await;
         assert_eq!(lines[0]["status"], 502);
+        assert_eq!(lines[0]["level"], "ERROR");
+        assert_eq!(lines[0]["error_category"], "unsupported_hijack");
     }
 }
