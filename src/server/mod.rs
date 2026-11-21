@@ -3,6 +3,7 @@
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -262,7 +263,7 @@ where
     .await
     {
         Ok(prepared) => prepared,
-        Err(PrepareError::UnknownModel(_)) => {
+        Err(PrepareError::UnknownModel(id)) => {
             let request_state = RequestState::new(
                 started,
                 method.as_str().to_string(),
@@ -275,6 +276,9 @@ where
                 state.recorder.clone(),
                 state.logger.clone(),
             );
+            // Name the id the caller asked for, or the line says only that
+            // something was rejected, with an empty target and no model.
+            request_state.set_rejected_model(&id);
             request_state.fail("preparation_failed");
             return Ok(finish_local(
                 request_state,
@@ -551,6 +555,10 @@ pub struct RequestState {
     logger: Arc<JsonLogger>,
     finalized: AtomicBool,
     expected_response_bytes: AtomicU64,
+    /// A model id the caller asked for that nothing under the token serves.
+    /// Kept apart from `model`, which only ever holds a resolved model, so a
+    /// rejected id cannot be mistaken for one that was routed.
+    rejected_model: OnceLock<String>,
 }
 
 impl RequestState {
@@ -580,6 +588,7 @@ impl RequestState {
             logger,
             finalized: AtomicBool::new(false),
             expected_response_bytes: AtomicU64::new(u64::MAX),
+            rejected_model: OnceLock::new(),
         })
     }
 
@@ -599,6 +608,12 @@ impl RequestState {
             .as_ref()
             .map_or(0, |call| call.response.observed_bytes());
         expected != u64::MAX && observed == expected
+    }
+
+    /// Name the model id that could not be resolved, for the log line. The
+    /// first call wins, because the id comes from the body actually inspected.
+    fn set_rejected_model(&self, id: &str) {
+        let _ = self.rejected_model.set(id.to_string());
     }
 
     fn fail(&self, category: &'static str) {
@@ -629,6 +644,9 @@ impl RequestState {
         }
         if let Some(stream) = self.stream {
             event.insert("stream".into(), json!(stream));
+        }
+        if let Some(id) = self.rejected_model.get() {
+            event.insert("rejected_model".into(), json!(id));
         }
         if let Some(call) = &self.call {
             event.insert("request_id".into(), json!(call.id()));
@@ -855,6 +873,11 @@ mod tests {
         let lines = log_lines(temp.path()).await;
         assert_eq!(lines[0]["status"], 400);
         assert!(lines[0].get("request_id").is_some());
+        // The rejected id is the only clue to which request was refused.
+        assert_eq!(lines[0]["rejected_model"], "unknown");
+        assert_eq!(lines[0]["target"], "");
+        // It must not appear as a resolved model, and the record is unchanged.
+        assert!(lines[0].get("model").is_none());
         let mut files = Vec::new();
         for day in std::fs::read_dir(temp.path().join("conversations")).unwrap() {
             for file in std::fs::read_dir(day.unwrap().path()).unwrap() {
