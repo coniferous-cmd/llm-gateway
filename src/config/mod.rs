@@ -462,20 +462,8 @@ fn parse_models(
                 format!("{context} must be a mapping"),
             ));
         }
-        let id = string_field(item, "id", &context)?.unwrap_or_default();
-        if id.trim().is_empty() {
-            return Err(ConfigError::at(
-                yaml::field_line(item, "id"),
-                format!("{context}.id is required"),
-            ));
-        }
-        let name = string_field(item, "name", &context)?.unwrap_or_default();
-        if name.trim().is_empty() {
-            return Err(ConfigError::at(
-                yaml::field_line(item, "name"),
-                format!("{context}.name is required"),
-            ));
-        }
+        let id = trimmed_required(item, "id", &context)?;
+        let name = trimmed_required(item, "name", &context)?;
         if !seen.insert(id.clone()) {
             return Err(ConfigError::at(
                 yaml::field_line(item, "id"),
@@ -490,6 +478,26 @@ fn parse_models(
         });
     }
     Ok(models)
+}
+
+/// A required string, kept trimmed and never blank.
+///
+/// Surrounding whitespace carries no meaning in a model id or an upstream
+/// name, yet storing it verbatim makes the entry unmatchable in practice: the
+/// id is advertised by `/v1/models` with the padding, requests naming the
+/// clean id no caller can read out of that list are rejected as unknown, and
+/// the rejection looks like a model that is declared. Peer names are already
+/// compared trimmed.
+fn trimmed_required(node: &Node, name: &str, context: &str) -> Result<String, ConfigError> {
+    let raw = string_field(node, name, context)?.unwrap_or_default();
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err(ConfigError::at(
+            yaml::field_line(node, name),
+            format!("{context}.{name} is required"),
+        ));
+    }
+    Ok(value.to_string())
 }
 
 /// An optional, positive token count. Omitted, null and `null`-valued all
@@ -616,6 +624,42 @@ mod tests {
 
         let err = parse(
             "keys:\n  - token: dev\n    target: {base_url: 'https://a.example'}\n    models: [{id: m, name: a}]\n  - token: dev\n    target: {base_url: 'https://b.example'}\n    models: [{id: m, name: b}]\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("already declared"), "{err}");
+    }
+
+    #[test]
+    fn trims_model_ids_and_names() {
+        let cfg = parse(
+            "keys:\n  - token: dev\n    target:\n      base_url: https://example.com\n    models:\n      - {id: '  spaced  ', name: '  Up  '}\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.keys["dev"][0].models[0].id, "spaced");
+        assert_eq!(cfg.keys["dev"][0].models[0].name, "Up");
+    }
+
+    #[test]
+    fn blank_model_id_or_name_is_rejected_as_missing() {
+        // Double-quoted so YAML decodes the tab instead of keeping `\t` as two
+        // literal characters.
+        for blank in ["''", "' '", "\"\\t\""] {
+            let source = format!(
+                "keys:\n  - token: dev\n    target:\n      base_url: https://example.com\n    models:\n      - {{id: m, name: {blank}}}\n"
+            );
+            let err = parse(&source).unwrap_err().to_string();
+            assert!(err.contains("name is required"), "{blank}: {err}");
+        }
+        let source = "keys:\n  - token: dev\n    target:\n      base_url: https://example.com\n    models:\n      - {id: ' ', name: n}\n";
+        let err = parse(source).unwrap_err().to_string();
+        assert!(err.contains("id is required"), "{err}");
+    }
+
+    #[test]
+    fn padded_id_collides_with_the_clean_id_of_the_same_token() {
+        let err = parse(
+            "keys:\n  - token: dev\n    target: {base_url: 'https://a'}\n    models: [{id: m, name: a}]\n  - token: dev\n    target: {base_url: 'https://b'}\n    models: [{id: ' m ', name: b}]\n",
         )
         .unwrap_err()
         .to_string();
