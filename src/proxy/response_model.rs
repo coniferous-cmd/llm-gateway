@@ -23,10 +23,17 @@ pub(crate) enum Endpoint {
 
 impl Endpoint {
     pub(crate) fn from_path(path: &str) -> Option<Self> {
-        match path.split('?').next()? {
-            "/v1/chat/completions" => Some(Self::ChatCompletions),
-            "/v1/messages" => Some(Self::Messages),
-            _ => None,
+        // A provider's endpoint may sit under a prefix the target forwards
+        // unchanged, such as DeepSeek's `/anthropic/v1/messages`, so match the
+        // trailing segment. Matching the leading slash keeps `/xv1/messages`
+        // from being mistaken for the Anthropic endpoint.
+        let path = path.split('?').next()?;
+        if path.ends_with("/v1/chat/completions") {
+            Some(Self::ChatCompletions)
+        } else if path.ends_with("/v1/messages") {
+            Some(Self::Messages)
+        } else {
+            None
         }
     }
 }
@@ -413,6 +420,25 @@ mod tests {
             false,
         )
         .unwrap_or_else(|_| panic!("SSE must be inspected"))
+    }
+
+    #[test]
+    fn endpoint_matches_the_trailing_segment_under_a_prefix() {
+        assert!(matches!(
+            Endpoint::from_path("/v1/messages"),
+            Some(Endpoint::Messages)
+        ));
+        assert!(matches!(
+            Endpoint::from_path("/anthropic/v1/messages?beta=true"),
+            Some(Endpoint::Messages)
+        ));
+        assert!(matches!(
+            Endpoint::from_path("/openai/v1/chat/completions"),
+            Some(Endpoint::ChatCompletions)
+        ));
+        assert!(Endpoint::from_path("/v1/messages/extra").is_none());
+        assert!(Endpoint::from_path("/xv1/messages").is_none());
+        assert!(Endpoint::from_path("/anthropic/messages").is_none());
     }
 
     #[tokio::test]

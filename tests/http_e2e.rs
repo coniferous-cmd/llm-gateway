@@ -2032,6 +2032,31 @@ async fn matched_response_ids_cover_protocols_suffixes_and_same_name_mappings() 
 }
 
 #[tokio::test]
+async fn prefixed_anthropic_path_still_restores_the_model_id() {
+    if !loopback_available() {
+        eprintln!("skipping: loopback binding is unavailable in this environment");
+        return;
+    }
+    // DeepSeek serves the Anthropic shape under `/anthropic`, so the target
+    // forwards the prefix unchanged instead of rewriting it away.
+    let reply = b"event: message_start\ndata: {\"message\":{\"model\":\"provider-20261101\"}}\n\n";
+    let expected = b"event: message_start\ndata: {\"message\":{\"model\":\"alias[1m]\"}}\n\n";
+    let upstream = start_static_upstream(StatusCode::OK, "text/event-stream", reply).await;
+    let gateway = start_gateway(
+        &upstream,
+        vec![],
+        vec![response_mapping("alias[1m]", "provider[1m]")],
+        false,
+    )
+    .await;
+    let response = model_request(&gateway, "/anthropic/v1/messages", "alias[1m]").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_bytes(response.into_body()).await, &expected[..]);
+    assert_eq!(upstream.records()[0].uri, "/anthropic/v1/messages");
+    gateway.stop().await;
+}
+
+#[tokio::test]
 async fn overlapping_responses_restore_their_own_alias_in_reverse_order() {
     if !loopback_available() {
         eprintln!("skipping: loopback binding is unavailable in this environment");
