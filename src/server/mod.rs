@@ -197,6 +197,29 @@ where
         .map(str::to_string);
     let body = request.into_body();
 
+    // Claude Code warms a connection by probing this path without any
+    // credentials, so the probe is answered before the token gate: otherwise
+    // it would be rejected as unauthorized and the client would report the
+    // gateway as unreachable. The base URL may carry any prefix, and no target
+    // has been selected yet, so the path is matched by its trailing segment
+    // rather than after rewrite rules. The empty 200 carries no payload and no
+    // content type, because the caller only reads the connection.
+    if matches!(method, Method::GET | Method::HEAD) && bodyless && is_warmup(&decoded_path) {
+        let request_state = RequestState::new(
+            started,
+            method.as_str().to_string(),
+            decoded_path.clone(),
+            String::new(),
+            None,
+            None,
+            StatusCode::OK.as_u16(),
+            None,
+            None,
+            state.logger.clone(),
+        );
+        return Ok(finish_local_empty(request_state, StatusCode::OK));
+    }
+
     let authorization = headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -278,27 +301,6 @@ where
             state.logger.clone(),
         );
         return Ok(finish_local_json(request_state, StatusCode::OK, &body));
-    }
-
-    // Claude Code warms a connection by probing this path. Answering it here
-    // keeps the probe from reaching a provider that may not implement it, and
-    // the empty body is all the caller reads. Like the model list, the path is
-    // matched after the selected target's rewrite rules, and the round-robin
-    // counter is not advanced.
-    if matches!(method, Method::GET | Method::HEAD) && bodyless && is_warmup(&uri, &route.peek()) {
-        let request_state = RequestState::new(
-            started,
-            method.as_str().to_string(),
-            decoded_path,
-            String::new(),
-            None,
-            None,
-            StatusCode::OK.as_u16(),
-            call.clone(),
-            state.recorder.clone(),
-            state.logger.clone(),
-        );
-        return Ok(finish_local_empty(request_state, StatusCode::OK));
     }
 
     let prepared = match prepare::prepare(
@@ -486,10 +488,11 @@ fn is_model_list(uri: &http::Uri, target: &Target) -> bool {
     forwarded_path(uri, target).split('?').next() == Some(MODEL_LIST_PATH)
 }
 
-/// Whether the request's path, after the selected target's rewrite rules,
-/// names Claude Code's connection warm-up probe. The query string is ignored.
-fn is_warmup(uri: &http::Uri, target: &Target) -> bool {
-    forwarded_path(uri, target).split('?').next() == Some(WARMUP_PATH)
+/// Whether the request path names Claude Code's connection warm-up probe. The
+/// probe is issued under the caller's base URL, so any prefix may precede the
+/// fixed trailing segment; a path that merely starts with it does not match.
+fn is_warmup(path: &str) -> bool {
+    path.ends_with(WARMUP_PATH)
 }
 
 /// Serialize the key's declared models in the shape the caller's SDK expects:
@@ -1230,23 +1233,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn warmup_probe_is_answered_locally_after_rewriting() {
-        use crate::config::RewriteRule;
-
+    async fn warmup_probe_is_answered_locally_without_credentials() {
         let temp = tempdir().unwrap();
-        let mut entry = entry(&[]);
-        entry.target.rewrite = vec![RewriteRule {
-            source: "/anthropic".into(),
-            destination: String::new(),
-        }];
-        let state = state(temp.path(), vec![entry]);
+        let state = state(temp.path(), vec![entry(&[])]);
 
         for (method, path) in [
-            (Method::GET, "/anthropic/api/hello"),
             (Method::HEAD, "/anthropic/api/hello"),
+            (Method::GET, "/anthropic/api/hello"),
+            (Method::GET, "/api/hello"),
             (Method::GET, "/api/hello?probe=1"),
         ] {
-            let response = handle(state.clone(), request(method, path, "Bearer dev", b""))
+            let response = handle(state.clone(), request(method, path, "", b""))
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK, "{path}");
@@ -1256,9 +1253,27 @@ mod tests {
         }
 
         let lines = log_lines(temp.path()).await;
-        assert_eq!(lines.len(), 3);
+        assert_eq!(lines.len(), 4);
         assert_eq!(lines[0]["status"], 200);
+        assert_eq!(lines[0]["method"], "HEAD");
         assert_eq!(lines[0]["path"], "/anthropic/api/hello");
+        assert_eq!(lines[0]["target"], "");
+    }
+
+    #[tokio::test]
+    async fn a_request_that_only_looks_like_the_warmup_probe_is_still_gated() {
+        let temp = tempdir().unwrap();
+        let state = state(temp.path(), vec![entry(&[])]);
+        for (method, path, body) in [
+            (Method::GET, "/api/hello/extra", &b""[..]),
+            // A probe carries no body; a POST to the same path is a real call.
+            (Method::POST, "/api/hello", &b"{}"[..]),
+        ] {
+            let response = handle(state.clone(), request(method, path, "", body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+        }
     }
 
     #[tokio::test]

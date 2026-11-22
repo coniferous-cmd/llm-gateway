@@ -1179,8 +1179,8 @@ async fn anthropic_model_listing_is_served_locally() {
 }
 
 /// Claude Code warms a connection by probing `/api/hello` under its base
-/// URL. The gateway answers it after rewriting, with an empty 200, so the
-/// provider is never contacted.
+/// URL, without credentials. The gateway answers it before the token gate,
+/// with an empty 200, so the provider is never contacted.
 #[tokio::test]
 async fn anthropic_warmup_probe_is_answered_locally() {
     if !loopback_available() {
@@ -1200,10 +1200,10 @@ async fn anthropic_warmup_probe_is_answered_locally() {
     .await;
     let response = client()
         .request(request(
-            Method::GET,
+            Method::HEAD,
             &format!("{}/anthropic/api/hello", gateway.url()),
-            "Bearer dev",
-            &[("anthropic-version", "2023-06-01")],
+            "",
+            &[],
             b"",
         ))
         .await
