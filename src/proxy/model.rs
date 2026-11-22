@@ -1,6 +1,6 @@
-//! Byte-exact top-level JSON `model` inspection and replacement.
+//! Byte-exact JSON `model` inspection and replacement.
 //!
-//! Only the first top-level `model` key whose value is a string is considered.
+//! Lookups inspect the first matching member at each level.
 //! Everything outside that one string literal is preserved byte for byte, so
 //! whitespace, escaping, key order and number formats survive unchanged.
 
@@ -16,32 +16,16 @@ pub struct ModelSpan {
 /// Locate the first top-level `model` string in a JSON object body.
 pub fn model_value(body: &[u8]) -> Option<ModelSpan> {
     let mut scanner = Scanner { body, index: 0 };
-    scanner.skip_whitespace();
-    scanner.expect(b'{')?;
-    scanner.skip_whitespace();
-    if scanner.peek() == Some(b'}') {
-        return None;
-    }
-    loop {
-        let key = scanner.parse_string()?;
-        scanner.skip_whitespace();
-        scanner.expect(b':')?;
-        scanner.skip_whitespace();
-        if key.0 == "model" {
-            if scanner.peek() != Some(b'"') {
-                return None;
-            }
-            let (value, start, end) = scanner.parse_string_with_span()?;
-            return Some(ModelSpan { value, start, end });
-        }
-        scanner.skip_value()?;
-        scanner.skip_whitespace();
-        match scanner.next()? {
-            b',' => scanner.skip_whitespace(),
-            b'}' => return None,
-            _ => return None,
-        }
-    }
+    scanner.object_member("model")?;
+    scanner.model_span()
+}
+
+/// Locate the first string directly at `message.model`, with document offsets.
+pub(crate) fn message_model_value(body: &[u8]) -> Option<ModelSpan> {
+    let mut scanner = Scanner { body, index: 0 };
+    scanner.object_member("message")?;
+    scanner.object_member("model")?;
+    scanner.model_span()
 }
 
 /// Whether the caller asked for a streamed response.
@@ -127,6 +111,31 @@ struct Scanner<'a> {
 }
 
 impl<'a> Scanner<'a> {
+    /// Position the cursor at the value of the first matching object member.
+    fn object_member(&mut self, member: &str) -> Option<()> {
+        self.skip_whitespace();
+        self.expect(b'{')?;
+        self.skip_whitespace();
+        loop {
+            let (key, _, _) = self.parse_string()?;
+            self.skip_whitespace();
+            self.expect(b':')?;
+            self.skip_whitespace();
+            if key == member {
+                return Some(());
+            }
+            self.skip_value()?;
+            self.skip_whitespace();
+            self.expect(b',')?;
+            self.skip_whitespace();
+        }
+    }
+
+    fn model_span(&mut self) -> Option<ModelSpan> {
+        let (value, start, end) = self.parse_string_with_span()?;
+        Some(ModelSpan { value, start, end })
+    }
+
     fn peek(&self) -> Option<u8> {
         self.body.get(self.index).copied()
     }
@@ -178,64 +187,65 @@ impl<'a> Scanner<'a> {
     /// Validate and skip one JSON value. Nested values are parsed structurally
     /// so malformed input makes the whole body unresolvable, as in Go.
     fn skip_value(&mut self) -> Option<()> {
-        match self.peek()? {
-            b'"' => {
-                self.parse_string()?;
-                Some(())
-            }
-            b'{' => {
-                self.index += 1;
-                self.skip_whitespace();
-                if self.peek() == Some(b'}') {
-                    self.index += 1;
-                    return Some(());
-                }
-                loop {
+        let mut containers = Vec::new();
+        loop {
+            match self.peek()? {
+                b'"' => {
                     self.parse_string()?;
+                }
+                b'{' | b'[' => {
+                    let closing = if self.next()? == b'{' { b'}' } else { b']' };
                     self.skip_whitespace();
-                    self.expect(b':')?;
-                    self.skip_whitespace();
-                    self.skip_value()?;
-                    self.skip_whitespace();
-                    match self.next()? {
-                        b',' => self.skip_whitespace(),
-                        b'}' => return Some(()),
-                        _ => return None,
+                    if self.peek() == Some(closing) {
+                        self.index += 1;
+                    } else {
+                        containers.push(closing);
+                        self.skip_member_key(closing)?;
+                        continue;
                     }
                 }
-            }
-            b'[' => {
-                self.index += 1;
-                self.skip_whitespace();
-                if self.peek() == Some(b']') {
+                b't' => self.literal(b"true")?,
+                b'f' => self.literal(b"false")?,
+                b'n' => self.literal(b"null")?,
+                b'-' | b'0'..=b'9' => {
                     self.index += 1;
+                    while matches!(
+                        self.peek(),
+                        Some(b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
+                    ) {
+                        self.index += 1;
+                    }
+                }
+                _ => return None,
+            }
+            loop {
+                let Some(&closing) = containers.last() else {
                     return Some(());
-                }
-                loop {
-                    self.skip_value()?;
-                    self.skip_whitespace();
-                    match self.next()? {
-                        b',' => self.skip_whitespace(),
-                        b']' => return Some(()),
-                        _ => return None,
+                };
+                self.skip_whitespace();
+                match self.next()? {
+                    b',' => {
+                        self.skip_whitespace();
+                        self.skip_member_key(closing)?;
+                        break;
                     }
+                    byte if byte == closing => {
+                        containers.pop();
+                    }
+                    _ => return None,
                 }
             }
-            b't' => self.literal(b"true"),
-            b'f' => self.literal(b"false"),
-            b'n' => self.literal(b"null"),
-            b'-' | b'0'..=b'9' => {
-                self.index += 1;
-                while matches!(
-                    self.peek(),
-                    Some(b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
-                ) {
-                    self.index += 1;
-                }
-                Some(())
-            }
-            _ => None,
         }
+    }
+
+    fn skip_member_key(&mut self, closing: u8) -> Option<()> {
+        if closing == b'}' {
+            self.parse_string()?;
+            self.skip_whitespace();
+            self.expect(b':')?;
+            self.skip_whitespace();
+        }
+        Some(())
     }
 
     fn literal(&mut self, literal: &[u8]) -> Option<()> {
@@ -253,6 +263,34 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
+
+    #[test]
+    fn message_model_uses_the_first_direct_member_and_preserves_external_bytes() {
+        let original = "{ \"model\":\"outside\", \"mes\\u0073age\":{ \"other\":{\"model\":\"nested\"}, \"m\\u006fdel\" : \"旧\\\"\\n\", \"model\":\"later\" }, \"message\":{\"model\":\"second\"} }";
+        let span = message_model_value(original.as_bytes()).unwrap();
+        assert_eq!(span.value, "旧\"\n");
+        assert_eq!(&original[span.start..span.end], r#""旧\"\n""#);
+
+        let replacement = "新\"\n\u{0001}<>&\u{2028}\u{2029}";
+        let expected_literal = r#""新\"\n\u0001\u003c\u003e\u0026\u2028\u2029""#;
+        let replaced = splice_model_value(original.as_bytes(), &span, replacement);
+        assert_eq!(&replaced[..span.start], &original.as_bytes()[..span.start]);
+        let end = span.start + expected_literal.len();
+        assert_eq!(&replaced[span.start..end], expected_literal.as_bytes());
+        assert_eq!(&replaced[end..], &original.as_bytes()[span.end..]);
+        assert_eq!(message_model_value(&replaced).unwrap().value, replacement);
+
+        for body in [
+            r#"{"model":"top","other":{"message":{"model":"elsewhere"}}}"#,
+            r#"{"message":{"nested":{"model":"elsewhere"}}}"#,
+            r#"{"message":[],"message":{"model":"later"}}"#,
+            r#"{"message":{"model":null,"model":"later"}}"#,
+            r#"{"message":{"model":{}}}"#,
+            r#"{"message":false}"#,
+        ] {
+            assert_eq!(message_model_value(body.as_bytes()), None, "{body}");
+        }
+    }
 
     #[test]
     fn model_value_and_splice_table() {

@@ -48,6 +48,7 @@ pub struct Prepared {
     /// The caller's model id and upstream name, when one was inspected. For a
     /// legacy token both are the caller's id.
     pub model: Option<Model>,
+    matched_declaration: bool,
     /// Whether the caller asked for a streamed response, when the body was
     /// inspected as a JSON object.
     pub stream: Option<bool>,
@@ -55,6 +56,16 @@ pub struct Prepared {
     /// Whether the caller's `Content-Length` header must be removed because
     /// the body was replaced by a buffered copy.
     pub replace_content_length: bool,
+}
+
+impl Prepared {
+    /// The resolved ID is available only after a declaration matched.
+    pub fn resolved_model_id(&self) -> Option<&str> {
+        self.model
+            .as_ref()
+            .filter(|_| self.matched_declaration)
+            .map(|model| model.id.as_str())
+    }
 }
 
 impl std::fmt::Debug for Prepared {
@@ -85,6 +96,7 @@ pub async fn prepare(
         return Ok(Prepared {
             target: route.round_robin(),
             model: None,
+            matched_declaration: false,
             stream: None,
             body,
             replace_content_length: false,
@@ -97,6 +109,7 @@ pub async fn prepare(
         return Ok(Prepared {
             target: route.round_robin(),
             model: None,
+            matched_declaration: false,
             stream: None,
             body,
             replace_content_length: false,
@@ -110,6 +123,7 @@ pub async fn prepare(
         return Ok(Prepared {
             target: route.round_robin(),
             model: None,
+            matched_declaration: false,
             stream: None,
             body,
             replace_content_length: false,
@@ -123,6 +137,7 @@ pub async fn prepare(
         return Ok(Prepared {
             target: route.round_robin(),
             model: None,
+            matched_declaration: false,
             stream,
             body,
             replace_content_length: true,
@@ -140,6 +155,7 @@ pub async fn prepare(
         return Ok(Prepared {
             target: route.round_robin(),
             model: Some(model),
+            matched_declaration: false,
             stream,
             body,
             replace_content_length: true,
@@ -157,6 +173,7 @@ pub async fn prepare(
     Ok(Prepared {
         target,
         model: Some(model),
+        matched_declaration: true,
         stream,
         body,
         replace_content_length: true,
@@ -301,6 +318,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(prepared.target.base_url, "https://one");
+        assert_eq!(prepared.resolved_model_id(), Some("alias"));
         assert_eq!(prepared.model.unwrap().name, "real");
         assert_eq!(collect(prepared.body).await, br#"{"model":"real","n":1}"#);
         assert!(prepared.replace_content_length);
@@ -387,6 +405,7 @@ mod tests {
         let route = routes.select("Bearer dev").unwrap();
         let original = br#"{"model":"whatever","n":1}"#;
         let prepared = prepare(route, body(original), None, None).await.unwrap();
+        assert_eq!(prepared.resolved_model_id(), None);
         let model = prepared.model.unwrap();
         assert_eq!(model.id, "whatever");
         assert_eq!(model.name, "whatever");

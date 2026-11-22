@@ -1078,12 +1078,12 @@ async fn anthropic_error_response_is_relayed_verbatim() {
 /// A non-streaming Anthropic reply keeps its nested `message.model` — the
 /// gateway does not rewrite response payloads.
 #[tokio::test]
-async fn anthropic_message_response_keeps_the_upstream_model_name() {
+async fn anthropic_message_response_restores_the_resolved_model_id() {
     if !loopback_available() {
         eprintln!("skipping: loopback binding is unavailable in this environment");
         return;
     }
-    const REPLY: &[u8] = br#"{"id":"msg_01","type":"message","role":"assistant","model":"claude-real","content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":1}}"#;
+    const REPLY: &[u8] = br#"{"id":"msg_01","type":"message","role":"assistant","model":"claude-real-20261101","content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":1}}"#;
     let upstream = start_static_upstream(StatusCode::OK, "application/json", REPLY).await;
     let gateway = start_gateway(
         &upstream,
@@ -1107,10 +1107,12 @@ async fn anthropic_message_response_keeps_the_upstream_model_name() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    assert!(!response.headers().contains_key("content-length"));
     let body = response.into_body().collect().await.unwrap().to_bytes();
-    assert_eq!(body.as_ref(), REPLY);
-    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(value["model"], "claude-real");
+    let expected = std::str::from_utf8(REPLY)
+        .unwrap()
+        .replace("claude-real-20261101", "alias");
+    assert_eq!(body.as_ref(), expected.as_bytes());
     // The request was still rewritten to the upstream name.
     assert_eq!(
         upstream.records()[0].body.as_ref(),
@@ -1762,4 +1764,685 @@ async fn truncated_gzip_marks_the_record_incomplete() {
     assert_eq!(record["error"], "upstream_decode");
     assert_eq!(record["response_complete"], false);
     gateway.stop().await;
+}
+
+const RESPONSE_JSON_LIMIT: usize = 32 << 20;
+const RESPONSE_SSE_LIMIT: usize = 1 << 20;
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct ResponseScript {
+    content_type: &'static str,
+    gzip: bool,
+    content_length: Option<usize>,
+    clean: bool,
+}
+
+impl ResponseScript {
+    fn chunked(content_type: &'static str) -> Self {
+        Self {
+            content_type,
+            gzip: false,
+            content_length: None,
+            clean: true,
+        }
+    }
+}
+
+/// A loopback upstream whose headers arrive immediately and whose data writes
+/// and termination are controlled by the test.
+async fn start_scripted_responses(
+    scripts: Vec<ResponseScript>,
+) -> (Upstream, Vec<tokio::sync::mpsc::Sender<Bytes>>) {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::sync::mpsc;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (shutdown, mut shutdown_rx) = watch::channel(false);
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let (senders, receivers): (Vec<_>, Vec<_>) =
+        scripts.iter().map(|_| mpsc::channel::<Bytes>(2)).unzip();
+    let service_records = records.clone();
+
+    tokio::spawn(async move {
+        for (script, mut receiver) in scripts.into_iter().zip(receivers) {
+            let (stream, _) = tokio::select! {
+                _ = shutdown_rx.changed() => return,
+                connection = listener.accept() => connection.unwrap(),
+            };
+            let records = service_records.clone();
+            tokio::spawn(async move {
+                let mut stream = BufReader::new(stream);
+                let mut first_line = String::new();
+                stream.read_line(&mut first_line).await.unwrap();
+                let mut first_line = first_line.split_whitespace();
+                let method = first_line.next().unwrap().parse().unwrap();
+                let uri = first_line.next().unwrap().to_string();
+                let mut headers = HeaderMap::new();
+                loop {
+                    let mut line = String::new();
+                    stream.read_line(&mut line).await.unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    let (name, value) = line.split_once(':').unwrap();
+                    headers.append(
+                        name.parse::<http::HeaderName>().unwrap(),
+                        value.trim().parse().unwrap(),
+                    );
+                }
+                let length = headers["content-length"].to_str().unwrap().parse().unwrap();
+                let mut body = vec![0; length];
+                stream.read_exact(&mut body).await.unwrap();
+                records.lock().unwrap().push(Recorded {
+                    method,
+                    uri,
+                    headers,
+                    body: body.into(),
+                });
+                let mut stream = stream.into_inner();
+
+                let framing = match script.content_length {
+                    Some(length) => format!("Content-Length: {length}\r\n"),
+                    None => "Transfer-Encoding: chunked\r\n".to_string(),
+                };
+                let encoding = if script.gzip {
+                    "Content-Encoding: gzip\r\n"
+                } else {
+                    ""
+                };
+                let content_type = script.content_type;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n{framing}{encoding}ETag: \"original\"\r\nContent-MD5: original\r\nContent-Digest: original\r\nX-Keep: yes\r\n\r\n"
+                );
+                stream.write_all(head.as_bytes()).await.unwrap();
+                let chunked = script.content_length.is_none();
+                while let Some(bytes) = receiver.recv().await {
+                    if chunked {
+                        stream
+                            .write_all(format!("{:x}\r\n", bytes.len()).as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                    stream.write_all(&bytes).await.unwrap();
+                    if chunked {
+                        stream.write_all(b"\r\n").await.unwrap();
+                    }
+                }
+                if chunked && script.clean {
+                    stream.write_all(b"0\r\n\r\n").await.unwrap();
+                }
+                stream.shutdown().await.unwrap();
+            });
+        }
+    });
+    (
+        Upstream {
+            address,
+            records,
+            shutdown,
+        },
+        senders,
+    )
+}
+
+async fn scripted_response(script: ResponseScript) -> (Upstream, tokio::sync::mpsc::Sender<Bytes>) {
+    let (upstream, mut senders) = start_scripted_responses(vec![script]).await;
+    (upstream, senders.pop().unwrap())
+}
+
+fn response_mapping(id: &str, name: &str) -> Model {
+    Model {
+        id: id.into(),
+        name: name.into(),
+        ..Model::default()
+    }
+}
+
+async fn model_request(gateway: &Gateway, path: &str, model: &str) -> Response<Incoming> {
+    let mut request = request(
+        Method::POST,
+        &format!("{}{path}", gateway.url()),
+        "Bearer dev",
+        &[
+            ("content-type", "application/json"),
+            ("accept-encoding", "gzip"),
+        ],
+        b"",
+    );
+    *request.body_mut() = Full::new(Bytes::from(format!(r#"{{"model":"{model}"}}"#)));
+    tokio::time::timeout(RESPONSE_TIMEOUT, client().request(request))
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+async fn response_bytes(body: Incoming) -> Bytes {
+    tokio::time::timeout(RESPONSE_TIMEOUT, body.collect())
+        .await
+        .unwrap()
+        .unwrap()
+        .to_bytes()
+}
+
+async fn read_response_prefix(body: &mut Incoming, len: usize) -> Vec<u8> {
+    tokio::time::timeout(RESPONSE_TIMEOUT, async {
+        let mut bytes = Vec::new();
+        while bytes.len() < len {
+            let frame = body.frame().await.unwrap().unwrap();
+            bytes.extend_from_slice(frame.data_ref().unwrap());
+        }
+        bytes
+    })
+    .await
+    .unwrap()
+}
+
+async fn read_before_body_error(mut body: Incoming) -> Vec<u8> {
+    tokio::time::timeout(RESPONSE_TIMEOUT, async {
+        let mut bytes = Vec::new();
+        loop {
+            match body.frame().await {
+                Some(Ok(frame)) => bytes.extend_from_slice(frame.data_ref().unwrap()),
+                Some(Err(_)) => return bytes,
+                None => panic!("incomplete upstream response ended cleanly"),
+            }
+        }
+    })
+    .await
+    .unwrap()
+}
+
+type StreamingGzip = async_compression::tokio::write::GzipEncoder<Vec<u8>>;
+
+async fn gzip_chunk(encoder: &mut StreamingGzip, bytes: &[u8]) -> Bytes {
+    use tokio::io::AsyncWriteExt;
+    encoder.write_all(bytes).await.unwrap();
+    encoder.flush().await.unwrap();
+    std::mem::take(encoder.get_mut()).into()
+}
+
+async fn gzip_finish(encoder: &mut StreamingGzip) -> Bytes {
+    use tokio::io::AsyncWriteExt;
+    encoder.shutdown().await.unwrap();
+    std::mem::take(encoder.get_mut()).into()
+}
+
+type MatchedResponseCase = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static [u8],
+    &'static [u8],
+);
+
+#[tokio::test]
+async fn matched_response_ids_cover_protocols_suffixes_and_same_name_mappings() {
+    if !loopback_available() {
+        eprintln!("skipping: loopback binding is unavailable in this environment");
+        return;
+    }
+    let cases: [MatchedResponseCase; 4] = [
+        (
+            "/v1/chat/completions", "application/json", "same", "same",
+            br#"{ "model" : "same-20261101", "n":1e+2 }"#,
+            br#"{ "model" : "same", "n":1e+2 }"#,
+        ),
+        (
+            "/v1/messages", "application/json", "alias[1m]", "provider[1m]",
+            br#"{"model":"provider-20261101","content":[]}"#,
+            br#"{"model":"alias[1m]","content":[]}"#,
+        ),
+        (
+            "/v1/chat/completions", "text/event-stream", "alias[1m]", "provider[1m]",
+            b"data: {\"model\":\"provider-20261101\"}\n\ndata: {\"model\":null}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            b"data: {\"model\":\"alias[1m]\"}\n\ndata: {\"model\":null}\n\ndata: {}\n\ndata: [DONE]\n\n",
+        ),
+        (
+            "/anthropic/messages", "text/event-stream", "same", "same",
+            b"event: message_start\ndata: {\"message\":{\"model\":\"same-20261101\"}}\n\nevent: message_start\ndata: {\"message\":{\"model\":5}}\n\nevent: message_start\ndata: {\"message\":{}}\n\n",
+            b"event: message_start\ndata: {\"message\":{\"model\":\"same\"}}\n\nevent: message_start\ndata: {\"message\":{\"model\":5}}\n\nevent: message_start\ndata: {\"message\":{}}\n\n",
+        ),
+    ];
+    for (path, content_type, id, upstream_name, reply, expected) in cases {
+        let upstream = start_static_upstream(StatusCode::OK, content_type, reply).await;
+        let gateway = start_gateway(
+            &upstream,
+            vec![RewriteRule {
+                source: "/anthropic".into(),
+                destination: "/v1".into(),
+            }],
+            vec![
+                response_mapping("same", "same"),
+                response_mapping("alias", "provider"),
+            ],
+            false,
+        )
+        .await;
+        let response = model_request(&gateway, path, id).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_bytes(response.into_body()).await, expected);
+        assert_eq!(
+            upstream.records()[0].body,
+            format!(r#"{{"model":"{upstream_name}"}}"#)
+        );
+        gateway.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn overlapping_responses_restore_their_own_alias_in_reverse_order() {
+    if !loopback_available() {
+        eprintln!("skipping: loopback binding is unavailable in this environment");
+        return;
+    }
+    let (upstream, mut senders) = start_scripted_responses(vec![
+        ResponseScript::chunked("application/json"),
+        ResponseScript::chunked("application/json"),
+    ])
+    .await;
+    let second = senders.pop().unwrap();
+    let first = senders.pop().unwrap();
+    let gateway = start_gateway(
+        &upstream,
+        vec![],
+        vec![
+            response_mapping("first", "provider"),
+            response_mapping("second", "provider"),
+        ],
+        false,
+    )
+    .await;
+    let path = "/v1/chat/completions";
+    let response_first = model_request(&gateway, path, "first").await;
+    let response_second = model_request(&gateway, path, "second").await;
+    let provider = Bytes::from_static(br#"{"model":"provider-20261101"}"#);
+    second.send(provider.clone()).await.unwrap();
+    drop(second);
+    assert_eq!(
+        response_bytes(response_second.into_body()).await,
+        br#"{"model":"second"}"#[..]
+    );
+    first.send(provider).await.unwrap();
+    drop(first);
+    assert_eq!(
+        response_bytes(response_first.into_body()).await,
+        br#"{"model":"first"}"#[..]
+    );
+    assert!(
+        upstream
+            .records()
+            .iter()
+            .all(|r| r.body == br#"{"model":"provider"}"#[..])
+    );
+    gateway.stop().await;
+}
+
+#[tokio::test]
+async fn inspected_sse_flushes_split_and_coalesced_events_before_eof() {
+    if !loopback_available() {
+        eprintln!("skipping: loopback binding is unavailable in this environment");
+        return;
+    }
+    for gzip in [false, true] {
+        let (upstream, sender) = scripted_response(ResponseScript {
+            gzip,
+            ..ResponseScript::chunked("Text/Event-Stream; charset=utf-8")
+        })
+        .await;
+        let gateway = start_gateway(
+            &upstream,
+            vec![],
+            vec![response_mapping("alias", "real")],
+            true,
+        )
+        .await;
+        let response = model_request(&gateway, "/v1/chat/completions", "alias").await;
+        for name in [
+            "content-length",
+            "content-encoding",
+            "content-md5",
+            "content-digest",
+            "etag",
+        ] {
+            assert!(!response.headers().contains_key(name), "{name}");
+        }
+        assert_eq!(response.headers()["x-keep"], "yes");
+        let mut body = response.into_body();
+        let mut encoder = StreamingGzip::new(Vec::new());
+        for chunk in [
+            &b"data: {\"mod"[..],
+            b"el\":\"real\"}\n\ndata: {\"model\":\"real\"}\n\n",
+        ] {
+            let wire = if gzip {
+                gzip_chunk(&mut encoder, chunk).await
+            } else {
+                Bytes::from_static(chunk)
+            };
+            sender.send(wire).await.unwrap();
+        }
+        let expected = b"data: {\"model\":\"alias\"}\n\ndata: {\"model\":\"alias\"}\n\n";
+        assert_eq!(
+            read_response_prefix(&mut body, expected.len()).await,
+            expected
+        );
+        if gzip {
+            sender.send(gzip_finish(&mut encoder).await).await.unwrap();
+        }
+        drop(sender);
+        assert!(response_bytes(body).await.is_empty());
+        let record = &conversation_records(&gateway)[0];
+        assert_eq!(
+            record["response"]["data"],
+            std::str::from_utf8(expected).unwrap()
+        );
+        assert_eq!(record["response_complete"], true);
+        gateway.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn inspected_json_waits_for_eof_and_handles_split_model_fields() {
+    if !loopback_available() {
+        eprintln!("skipping: loopback binding is unavailable in this environment");
+        return;
+    }
+    for gzip in [false, true] {
+        let (upstream, sender) = scripted_response(ResponseScript {
+            gzip,
+            ..ResponseScript::chunked("application/json; charset=utf-8")
+        })
+        .await;
+        let gateway = start_gateway(
+            &upstream,
+            vec![],
+            vec![response_mapping("alias", "real")],
+            false,
+        )
+        .await;
+        let mut body = model_request(&gateway, "/v1/messages", "alias")
+            .await
+            .into_body();
+        let mut encoder = StreamingGzip::new(Vec::new());
+        // Exercise exactly 32 MiB of decoded data in the identity case.
+        let mut payload = br#"{ "model" : "real", "n": 1e999 }"#.to_vec();
+        if !gzip {
+            payload.resize(RESPONSE_JSON_LIMIT, b' ');
+        }
+        for chunk in [&payload[..6], &payload[6..15], &payload[15..]] {
+            let wire = if gzip {
+                gzip_chunk(&mut encoder, chunk).await
+            } else {
+                Bytes::copy_from_slice(chunk)
+            };
+            sender.send(wire).await.unwrap();
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), body.frame())
+                .await
+                .is_err()
+        );
+        if gzip {
+            sender.send(gzip_finish(&mut encoder).await).await.unwrap();
+        }
+        drop(sender);
+        let mut expected = br#"{ "model" : "alias", "n": 1e999 }"#.to_vec();
+        if !gzip {
+            expected.resize(RESPONSE_JSON_LIMIT + 1, b' ');
+        }
+        assert_eq!(response_bytes(body).await, expected);
+        gateway.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn oversized_json_forwards_before_eof_with_known_or_discovered_length() {
+    if !loopback_available() {
+        eprintln!("skipping: loopback binding is unavailable in this environment");
+        return;
+    }
+    for (known, gzip) in [(true, false), (false, false), (false, true)] {
+        let mut payload = br#"{"model":"real","n":1}"#.to_vec();
+        let prefix_len = if known {
+            payload.len()
+        } else {
+            RESPONSE_JSON_LIMIT + 1
+        };
+        payload.resize(RESPONSE_JSON_LIMIT + 1, b' ');
+        let final_bytes = b"   ";
+        let (upstream, sender) = scripted_response(ResponseScript {
+            content_length: known.then_some(payload.len() + final_bytes.len()),
+            gzip,
+            ..ResponseScript::chunked("application/json")
+        })
+        .await;
+        let gateway = start_gateway(
+            &upstream,
+            vec![],
+            vec![response_mapping("alias", "real")],
+            false,
+        )
+        .await;
+        let response = model_request(&gateway, "/v1/messages", "alias").await;
+        assert_eq!(response.headers().contains_key("content-length"), known);
+        assert_eq!(response.headers().contains_key("etag"), known);
+        let mut body = response.into_body();
+        let mut encoder = StreamingGzip::new(Vec::new());
+        let prefix = &payload[..prefix_len];
+        let wire = if gzip {
+            gzip_chunk(&mut encoder, prefix).await
+        } else {
+            Bytes::copy_from_slice(prefix)
+        };
+        sender.send(wire).await.unwrap();
+        assert_eq!(read_response_prefix(&mut body, prefix_len).await, prefix);
+
+        let tail = &payload[prefix_len..];
+        if !tail.is_empty() {
+            sender.send(Bytes::copy_from_slice(tail)).await.unwrap();
+        }
+        let wire = if gzip {
+            gzip_chunk(&mut encoder, final_bytes).await
+        } else {
+            Bytes::from_static(final_bytes)
+        };
+        sender.send(wire).await.unwrap();
+        if gzip {
+            sender.send(gzip_finish(&mut encoder).await).await.unwrap();
+        }
+        drop(sender);
+        let received_tail = response_bytes(body).await;
+        assert_eq!(&received_tail[..tail.len()], tail);
+        assert_eq!(&received_tail[tail.len()..], final_bytes);
+        gateway.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn inspected_json_and_sse_preserve_partial_bytes_on_eof_and_body_failures() {
+    if !loopback_available() {
+        eprintln!("skipping: loopback binding is unavailable in this environment");
+        return;
+    }
+    let cases: [(&str, &[u8]); 3] = [
+        ("application/json", br#"{"model":"real""#),
+        ("application/json", br#"{"model":"real"}"#),
+        ("text/event-stream", b"data: {\"model\":\"real\"}\n"),
+    ];
+    for (content_type, partial) in cases {
+        for failure in [None, Some("upstream_read"), Some("upstream_decode")] {
+            let gzip = failure == Some("upstream_decode");
+            let (upstream, sender) = scripted_response(ResponseScript {
+                gzip,
+                clean: failure != Some("upstream_read"),
+                ..ResponseScript::chunked(content_type)
+            })
+            .await;
+            let gateway = start_gateway(
+                &upstream,
+                vec![],
+                vec![response_mapping("alias", "real")],
+                true,
+            )
+            .await;
+            let body = model_request(&gateway, "/v1/chat/completions", "alias")
+                .await
+                .into_body();
+            let wire = if gzip {
+                // A sync flush yields the plaintext, but no gzip trailer.
+                gzip_chunk(&mut StreamingGzip::new(Vec::new()), partial).await
+            } else {
+                Bytes::from_static(partial)
+            };
+            sender.send(wire).await.unwrap();
+            drop(sender);
+            let expected: &[u8] = if failure.is_none() && partial == br#"{"model":"real"}"# {
+                br#"{"model":"alias"}"#
+            } else {
+                partial
+            };
+            let received = if failure.is_some() {
+                read_before_body_error(body).await
+            } else {
+                response_bytes(body).await.to_vec()
+            };
+            assert_eq!(received, expected, "{content_type}, {failure:?}");
+            let record = &conversation_records(&gateway)[0];
+            assert_eq!(
+                record["response"]["data"],
+                std::str::from_utf8(expected).unwrap()
+            );
+            assert_eq!(record["response_complete"], failure.is_none());
+            if let Some(category) = failure {
+                assert_eq!(record["error"], category);
+            }
+            gateway.stop().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn oversized_sse_forwards_before_delimiter_and_resumes_rewriting() {
+    if !loopback_available() {
+        eprintln!("skipping: loopback binding is unavailable in this environment");
+        return;
+    }
+    for gzip in [false, true] {
+        let (upstream, sender) = scripted_response(ResponseScript {
+            gzip,
+            ..ResponseScript::chunked("text/event-stream")
+        })
+        .await;
+        let gateway = start_gateway(
+            &upstream,
+            vec![],
+            vec![response_mapping("alias", "real")],
+            false,
+        )
+        .await;
+        let mut body = model_request(&gateway, "/v1/chat/completions", "alias")
+            .await
+            .into_body();
+        let mut encoder = StreamingGzip::new(Vec::new());
+
+        let mut prefix = b"data: {\"model\":\"real\"}".to_vec();
+        prefix.resize(RESPONSE_SSE_LIMIT + 1, b' ');
+        let wire = if gzip {
+            gzip_chunk(&mut encoder, &prefix).await
+        } else {
+            Bytes::from(prefix.clone())
+        };
+        sender.send(wire).await.unwrap();
+        assert_eq!(read_response_prefix(&mut body, prefix.len()).await, prefix);
+
+        for plaintext in [&b"\r\n\r"[..], b"\ndata: {\"model\":\"real\"}\r\n\r\n"] {
+            let wire = if gzip {
+                gzip_chunk(&mut encoder, plaintext).await
+            } else {
+                Bytes::from_static(plaintext)
+            };
+            sender.send(wire).await.unwrap();
+        }
+        let expected = b"\r\n\r\ndata: {\"model\":\"alias\"}\r\n\r\n";
+        assert_eq!(
+            read_response_prefix(&mut body, expected.len()).await,
+            expected
+        );
+        if gzip {
+            sender.send(gzip_finish(&mut encoder).await).await.unwrap();
+        }
+        drop(sender);
+        assert!(response_bytes(body).await.is_empty());
+        gateway.stop().await;
+    }
+}
+
+type PassthroughResponseCase = (
+    StatusCode,
+    &'static str,
+    Vec<Model>,
+    &'static str,
+    &'static [u8],
+);
+
+#[tokio::test]
+async fn response_restoration_preserves_provider_errors_unmatched_and_other_endpoints() {
+    if !loopback_available() {
+        eprintln!("skipping: loopback binding is unavailable in this environment");
+        return;
+    }
+    let eligible = "/v1/chat/completions";
+    let cases: [PassthroughResponseCase; 6] = [
+        (
+            StatusCode::BAD_REQUEST,
+            eligible,
+            vec![response_mapping("alias", "real")],
+            "alias",
+            br#"{"model":"real","error":"invalid"}"#,
+        ),
+        (
+            StatusCode::OK,
+            eligible,
+            vec![],
+            "alias",
+            br#"{"model":"real"}"#,
+        ),
+        (
+            StatusCode::OK,
+            "/v1/embeddings",
+            vec![response_mapping("alias", "real")],
+            "alias",
+            br#"{"model":"real"}"#,
+        ),
+        (
+            StatusCode::OK,
+            eligible,
+            vec![response_mapping("alias", "real")],
+            "alias",
+            br#"{"nested":{"model":"real"}}"#,
+        ),
+        (
+            StatusCode::OK,
+            "/v1/messages",
+            vec![response_mapping("alias", "real")],
+            "alias",
+            br#"{"model":false}"#,
+        ),
+        (
+            StatusCode::OK,
+            "/v1/messages",
+            vec![response_mapping("alias", "real")],
+            "alias",
+            br#"{"model":"alias"}"#,
+        ),
+    ];
+    for (status, path, models, id, original) in cases {
+        let upstream = start_static_upstream(status, "application/json", original).await;
+        let gateway = start_gateway(&upstream, vec![], models, false).await;
+        let response = model_request(&gateway, path, id).await;
+        assert_eq!(response.status(), status);
+        assert_eq!(response_bytes(response.into_body()).await, original);
+        gateway.stop().await;
+    }
 }

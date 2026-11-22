@@ -1,5 +1,7 @@
 //! HTTP service pipeline: authentication, preparation, forwarding, logging.
 
+mod flush;
+
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -22,6 +24,7 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
+use self::flush::{DownstreamFlush, FlushBeforeError, FlushIo};
 use crate::config::{Model, Target};
 use crate::conversationlog::{Call, Store};
 use crate::keymap::{Map, Route};
@@ -29,6 +32,7 @@ use crate::logging::{JsonLogger, fields};
 use crate::proxy::decode::{self, DecodeError, ReadBody};
 use crate::proxy::forward::{BoxError as ForwardError, Forwarder, box_response, forwarded_path};
 use crate::proxy::prepare::{self, PrepareError, ReqBody};
+use crate::proxy::response_model::{self, Endpoint};
 
 /// Digest of the encoded representation; it no longer describes the decoded
 /// body, so it is dropped with `Content-Encoding`.
@@ -97,16 +101,34 @@ pub(crate) async fn serve_connection<S>(
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let logger = state.logger.clone();
+    let flush = Arc::new(DownstreamFlush::default());
+    let response_flush = flush.clone();
     let service = service_fn(move |request| {
         let state = state.clone();
-        async move { handle(state, request).await }
+        let flush = response_flush.clone();
+        async move {
+            let response = handle(state, request).await?;
+            let (mut parts, body) = response.into_parts();
+            let body = if parts.extensions.remove::<FlushBeforeError>().is_some() {
+                flush.wrap_body(body)
+            } else {
+                body
+            };
+            Ok::<_, Infallible>(Response::from_parts(parts, body))
+        }
     });
     let mut connection = Box::pin(
         hyper::server::conn::http1::Builder::new()
             .timer(TokioTimer::new())
             .header_read_timeout(Duration::from_secs(30))
             .keep_alive(true)
-            .serve_connection(TokioIo::new(stream), service),
+            .serve_connection(
+                TokioIo::new(FlushIo {
+                    inner: stream,
+                    flush,
+                }),
+                service,
+            ),
     );
     tokio::select! {
         result = &mut connection => {
@@ -334,6 +356,10 @@ where
     };
 
     let is_head = method == Method::HEAD;
+    let response_model = prepared.resolved_model_id().and_then(|id| {
+        Endpoint::from_path(&forwarded_path(&uri, &prepared.target))
+            .map(|endpoint| (endpoint, id.to_owned()))
+    });
     let model = prepared.model.clone();
     let stream = prepared.stream;
     let target = prepared.target.clone();
@@ -406,6 +432,26 @@ where
                     ));
                     box_response(body)
                 }
+            };
+            let body = match response_model {
+                Some((endpoint, id)) if !bodyless && !body.is_end_stream() => {
+                    match response_model::restore(
+                        body,
+                        endpoint,
+                        id,
+                        parts.status,
+                        &mut parts.headers,
+                        coding.is_some(),
+                    ) {
+                        Ok(body) => {
+                            request_state.set_expected_response_bytes(None);
+                            parts.extensions.insert(FlushBeforeError);
+                            body
+                        }
+                        Err(body) => body,
+                    }
+                }
+                _ => body,
             };
             let body = ObservedBody {
                 inner: body,
