@@ -15,5 +15,8 @@
 .DS_Store
 Thumbs.db
 
+# Local agent scratch/workspace data
+.agents/
+
 # Go artifacts from the pre-rewrite tree (kept out of the orphan branch)
 /vendor/
