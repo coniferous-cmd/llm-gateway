@@ -201,16 +201,11 @@ impl Forwarder {
         target: &Target,
         replace_content_length: bool,
     ) -> Result<Response<Incoming>, BoxError> {
-        let original = uri
-            .path_and_query()
-            .map_or("/", http::uri::PathAndQuery::as_str);
-        let path_and_query =
-            rewrite_path(original, &target.rewrite).unwrap_or_else(|| original.to_string());
         let (scheme, authority) = split_origin(&target.base_url)?;
         let upstream_uri = Uri::builder()
             .scheme(scheme)
             .authority(authority)
-            .path_and_query(path_and_query)
+            .path_and_query(forwarded_path(uri, target))
             .build()?;
 
         let mut headers = headers;
@@ -251,6 +246,14 @@ impl Forwarder {
             )) as BoxError),
         }
     }
+}
+
+/// Resolve the path and query using the selected target's rules.
+pub(crate) fn forwarded_path(uri: &Uri, target: &Target) -> String {
+    let original = uri
+        .path_and_query()
+        .map_or("/", http::uri::PathAndQuery::as_str);
+    rewrite_path(original, &target.rewrite).unwrap_or_else(|| original.to_string())
 }
 
 fn split_origin(base_url: &str) -> Result<(&str, &str), BoxError> {

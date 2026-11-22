@@ -27,9 +27,8 @@ use crate::conversationlog::{Call, Store};
 use crate::keymap::{Map, Route};
 use crate::logging::{JsonLogger, fields};
 use crate::proxy::decode::{self, DecodeError, ReadBody};
-use crate::proxy::forward::{BoxError as ForwardError, Forwarder, box_response};
+use crate::proxy::forward::{BoxError as ForwardError, Forwarder, box_response, forwarded_path};
 use crate::proxy::prepare::{self, PrepareError, ReqBody};
-use crate::proxy::rewrite::rewrite_path;
 
 /// Digest of the encoded representation; it no longer describes the decoded
 /// body, so it is dropped with `Content-Encoding`.
@@ -41,6 +40,11 @@ const ANTHROPIC_VERSION: http::header::HeaderName =
 
 /// The path, after the selected target's rewrite rules, answered locally.
 const MODEL_LIST_PATH: &str = "/v1/models";
+
+/// Claude Code's connection warm-up probe, answered locally as an empty 200.
+/// Its only purpose is to open the transport, so it carries no payload and
+/// no provider needs to implement it.
+const WARMUP_PATH: &str = "/api/hello";
 
 pub struct AppState {
     pub keys: Arc<Map>,
@@ -254,6 +258,27 @@ where
         return Ok(finish_local_json(request_state, StatusCode::OK, &body));
     }
 
+    // Claude Code warms a connection by probing this path. Answering it here
+    // keeps the probe from reaching a provider that may not implement it, and
+    // the empty body is all the caller reads. Like the model list, the path is
+    // matched after the selected target's rewrite rules, and the round-robin
+    // counter is not advanced.
+    if matches!(method, Method::GET | Method::HEAD) && bodyless && is_warmup(&uri, &route.peek()) {
+        let request_state = RequestState::new(
+            started,
+            method.as_str().to_string(),
+            decoded_path,
+            String::new(),
+            None,
+            None,
+            StatusCode::OK.as_u16(),
+            call.clone(),
+            state.recorder.clone(),
+            state.logger.clone(),
+        );
+        return Ok(finish_local_empty(request_state, StatusCode::OK));
+    }
+
     let prepared = match prepare::prepare(
         &route,
         request_body,
@@ -412,11 +437,13 @@ where
 /// Whether the request's path, after the selected target's rewrite rules,
 /// names the locally answered model list. The query string is ignored.
 fn is_model_list(uri: &http::Uri, target: &Target) -> bool {
-    let original = uri
-        .path_and_query()
-        .map_or("/", http::uri::PathAndQuery::as_str);
-    let path = rewrite_path(original, &target.rewrite).unwrap_or_else(|| original.to_string());
-    path.split('?').next() == Some(MODEL_LIST_PATH)
+    forwarded_path(uri, target).split('?').next() == Some(MODEL_LIST_PATH)
+}
+
+/// Whether the request's path, after the selected target's rewrite rules,
+/// names Claude Code's connection warm-up probe. The query string is ignored.
+fn is_warmup(uri: &http::Uri, target: &Target) -> bool {
+    forwarded_path(uri, target).split('?').next() == Some(WARMUP_PATH)
 }
 
 /// Serialize the key's declared models in the shape the caller's SDK expects:
@@ -493,6 +520,18 @@ fn finish_local_json(
     }
     state.finish();
     json_response(status, text)
+}
+
+/// A locally answered response with no payload and no content type.
+fn finish_local_empty(state: Arc<RequestState>, status: StatusCode) -> Response<ReqBody> {
+    state.set_status(status.as_u16());
+    if let Some(call) = &state.call {
+        call.response.observe(&[], true, false);
+    }
+    state.finish();
+    let mut response = Response::new(empty_body());
+    *response.status_mut() = status;
+    response
 }
 
 fn finish_local(state: Arc<RequestState>, status: StatusCode, text: &str) -> Response<ReqBody> {
@@ -1141,6 +1180,51 @@ mod tests {
         .await
         .unwrap();
         // No upstream listens on the configured address.
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn warmup_probe_is_answered_locally_after_rewriting() {
+        use crate::config::RewriteRule;
+
+        let temp = tempdir().unwrap();
+        let mut entry = entry(&[]);
+        entry.target.rewrite = vec![RewriteRule {
+            source: "/anthropic".into(),
+            destination: String::new(),
+        }];
+        let state = state(temp.path(), vec![entry]);
+
+        for (method, path) in [
+            (Method::GET, "/anthropic/api/hello"),
+            (Method::HEAD, "/anthropic/api/hello"),
+            (Method::GET, "/api/hello?probe=1"),
+        ] {
+            let response = handle(state.clone(), request(method, path, "Bearer dev", b""))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert!(response.headers().get(CONTENT_TYPE).is_none());
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            assert!(bytes.is_empty(), "{path}");
+        }
+
+        let lines = log_lines(temp.path()).await;
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0]["status"], 200);
+        assert_eq!(lines[0]["path"], "/anthropic/api/hello");
+    }
+
+    #[tokio::test]
+    async fn a_path_merely_containing_the_warmup_probe_is_still_forwarded() {
+        let temp = tempdir().unwrap();
+        let state = state(temp.path(), vec![entry(&[])]);
+        let response = handle(
+            state,
+            request(Method::GET, "/api/hello/extra", "Bearer dev", b""),
+        )
+        .await
+        .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
 

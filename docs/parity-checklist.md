@@ -175,6 +175,11 @@ combines several Go table rows into one parameterized test).
     present and in the OpenAI shape otherwise. A token without `models` gets
     an empty list, so an upstream catalog is never exposed through the
     gateway, and the round-robin counter is not advanced.
+12. **Local warm-up probe.** The Go reference forwards Claude Code's
+    connection warm-up probe upstream. This rewrite answers a bodyless `GET`
+    or `HEAD` whose path, after the selected target's rewrite rules, is
+    exactly `/api/hello` with an empty `200 OK` and no content type. No
+    provider is contacted and the round-robin counter is not advanced.
 
 ## Not done
 

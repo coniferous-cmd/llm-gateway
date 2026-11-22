@@ -1176,6 +1176,43 @@ async fn anthropic_model_listing_is_served_locally() {
     gateway.stop().await;
 }
 
+/// Claude Code warms a connection by probing `/api/hello` under its base
+/// URL. The gateway answers it after rewriting, with an empty 200, so the
+/// provider is never contacted.
+#[tokio::test]
+async fn anthropic_warmup_probe_is_answered_locally() {
+    if !loopback_available() {
+        eprintln!("skipping: loopback binding is unavailable in this environment");
+        return;
+    }
+    let upstream = start_echo_upstream().await;
+    let gateway = start_gateway(
+        &upstream,
+        vec![RewriteRule {
+            source: "/anthropic".into(),
+            destination: String::new(),
+        }],
+        vec![],
+        false,
+    )
+    .await;
+    let response = client()
+        .request(request(
+            Method::GET,
+            &format!("{}/anthropic/api/hello", gateway.url()),
+            "Bearer dev",
+            &[("anthropic-version", "2023-06-01")],
+            b"",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(bytes.is_empty());
+    assert_eq!(upstream.records().len(), 0, "the provider is not contacted");
+    gateway.stop().await;
+}
+
 #[tokio::test]
 async fn conversation_record_contains_request_and_response() {
     if !loopback_available() {
