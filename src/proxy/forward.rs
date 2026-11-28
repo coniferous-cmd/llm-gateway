@@ -233,7 +233,7 @@ impl Forwarder {
         *request.version_mut() = Version::HTTP_11;
         *request.headers_mut() = headers;
 
-        match tokio::time::timeout(Duration::from_secs(30), self.client.request(request)).await {
+        match tokio::time::timeout(Duration::from_secs(60), self.client.request(request)).await {
             Ok(Ok(response)) => {
                 let (mut parts, body) = response.into_parts();
                 remove_hop_by_hop(&mut parts.headers);
